@@ -1,0 +1,4 @@
+# Use the helper in tools/link.sh: it runs the normal system `cc` when there is one,
+# and falls back to Rust's own linker inside minimal sandboxes that have no C toolchain.
+[target.x86_64-unknown-linux-gnu]
+linker = "tools/link.sh"

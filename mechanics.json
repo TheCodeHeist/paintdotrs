@@ -1,0 +1,351 @@
+{
+ "version": 1,
+ "values": [
+  {
+   "name": "launcher",
+   "group": "program",
+   "value": "paintdotnet.exe loads paintdotnet.dll via hostfxr",
+   "source": "paintdotnet.exe FUN_140001430 0x140001430"
+  },
+  {
+   "name": "hostfxr lookup",
+   "group": "program",
+   "value": "nethost get_hostfxr_path fallback",
+   "source": "paintdotnet.exe FUN_140001190 0x140001190"
+  },
+  {
+   "name": "default primary colour",
+   "group": "colours",
+   "value": "black",
+   "source": "paintdotnet.dll ToolsSection..ctor 0x06002adf"
+  },
+  {
+   "name": "default secondary colour",
+   "group": "colours",
+   "value": "white",
+   "source": "paintdotnet.dll ToolsSection..ctor 0x06002adf"
+  },
+  {
+   "name": "antialiasing default",
+   "group": "tools",
+   "value": true,
+   "source": "paintdotnet.dll ToolsSection..ctor 0x06002adf"
+  },
+  {
+   "name": "tolerance default",
+   "group": "selection",
+   "value": 50,
+   "unit": "%",
+   "source": "paintdotnet.dll ToolsSection..ctor 0x06002adf"
+  },
+  {
+   "name": "tolerance alpha mode",
+   "group": "selection",
+   "value": "Straight",
+   "source": "paintdotnet.dll ToolsSection..ctor 0x06002adf + enum ToleranceAlphaMode"
+  },
+  {
+   "name": "tolerance curve",
+   "group": "selection",
+   "value": "t=round(v*255); FastScale(t,t)",
+   "source": "paintdotnet.dll ToleranceUtil.ConvertToByte 0x06001b98"
+  },
+  {
+   "name": "colour distance",
+   "group": "selection",
+   "value": "max(1, round(0.5*255*|a-b|)) over RGBA 0..1; identical = 0",
+   "source": "paintdotnet.dll FloodFillAlgorithm.GetDistanceStraight 0x0600200d / GetDistanceEuclidean 0x0600200e"
+  },
+  {
+   "name": "tolerance match",
+   "group": "selection",
+   "value": "distance <= tolerance byte",
+   "source": "paintdotnet.dll CheckColorStraightFunctor.Invoke 0x0600325f"
+  },
+  {
+   "name": "brush size default",
+   "group": "tools",
+   "value": 2,
+   "unit": "px",
+   "source": "paintdotnet.dll BrushSection..ctor 0x06003574"
+  },
+  {
+   "name": "brush size range",
+   "group": "tools",
+   "value": "1..2000",
+   "unit": "px",
+   "source": "paintdotnet.dll BrushSection..ctor 0x06003574"
+  },
+  {
+   "name": "brush spacing",
+   "group": "tools",
+   "value": 0.15,
+   "unit": "x size",
+   "source": "paintdotnet.dll BrushSection..ctor 0x06003574"
+  },
+  {
+   "name": "brush hardness",
+   "group": "tools",
+   "value": 0.75,
+   "source": "paintdotnet.dll BrushSection..ctor 0x06003574"
+  },
+  {
+   "name": "text size default",
+   "group": "tools",
+   "value": 12,
+   "unit": "pt",
+   "source": "paintdotnet.dll TextSection..ctor 0x06003575"
+  },
+  {
+   "name": "rounded rectangle radius",
+   "group": "tools",
+   "value": 10,
+   "unit": "px",
+   "source": "paintdotnet.dll ShapesSection..ctor 0x06003579"
+  },
+  {
+   "name": "zoom steps",
+   "group": "view",
+   "value": 45,
+   "source": "paintdotnet.dll ScaleFactor..cctor 0x060001c2"
+  },
+  {
+   "name": "zoom range",
+   "group": "view",
+   "value": "1..10000",
+   "unit": "%",
+   "source": "paintdotnet.dll ScaleFactor..cctor 0x060001c2"
+  },
+  {
+   "name": "FastScale",
+   "group": "maths",
+   "value": "((a*b+128)+((a*b+128)>>8))>>8",
+   "source": "PaintDotNet.Core.dll ByteUtil.FastScale 0x06000043"
+  },
+  {
+   "name": "intensity",
+   "group": "colour",
+   "value": "(7471 B + 38470 G + 19595 R) >> 16",
+   "source": "PaintDotNet.Core.dll ColorBgra.GetIntensityByte 0x06000132"
+  },
+  {
+   "name": "alpha composition",
+   "group": "layers",
+   "value": "(d*belowOnly + s*topOnly + blend*overlap)/total",
+   "source": "PaintDotNet.Core.dll CompositionOps.OpImpl.Apply 0x06001277"
+  },
+  {
+   "name": "blend Multiply",
+   "group": "layers",
+   "value": "FastScale(b,t)",
+   "source": "PaintDotNet.Core.dll CompositionOps/Multiply.BlendComponent 0x060011f2"
+  },
+  {
+   "name": "blend Additive",
+   "group": "layers",
+   "value": "min(255,b+t)",
+   "source": "PaintDotNet.Core.dll CompositionOps/Additive.BlendComponent 0x060011fc"
+  },
+  {
+   "name": "blend Color Burn",
+   "group": "layers",
+   "value": "t=0?0:max(0,255-(255-b)*255/t)",
+   "source": "PaintDotNet.Core.dll CompositionOps/ColorBurn.BlendComponent 0x06001206"
+  },
+  {
+   "name": "blend Color Dodge",
+   "group": "layers",
+   "value": "t=255?255:min(255,b*255/(255-t))",
+   "source": "PaintDotNet.Core.dll CompositionOps/ColorDodge.BlendComponent 0x06001210"
+  },
+  {
+   "name": "blend Reflect",
+   "group": "layers",
+   "value": "t=255?255:min(255,b*b/(255-t))",
+   "source": "PaintDotNet.Core.dll CompositionOps/Reflect.BlendComponent 0x0600121a"
+  },
+  {
+   "name": "blend Glow",
+   "group": "layers",
+   "value": "Reflect(t,b)",
+   "source": "PaintDotNet.Core.dll CompositionOps/Glow.BlendComponent 0x06001225"
+  },
+  {
+   "name": "blend Overlay",
+   "group": "layers",
+   "value": "b<128?FastScale(2b,t):255-FastScale(2(255-b),255-t)",
+   "source": "PaintDotNet.Core.dll CompositionOps/Overlay.BlendComponent 0x0600122f"
+  },
+  {
+   "name": "blend Difference",
+   "group": "layers",
+   "value": "|t-b|",
+   "source": "PaintDotNet.Core.dll CompositionOps/Difference.BlendComponent 0x06001239"
+  },
+  {
+   "name": "blend Negation",
+   "group": "layers",
+   "value": "255-|255-b-t|",
+   "source": "PaintDotNet.Core.dll CompositionOps/Negation.BlendComponent 0x06001243"
+  },
+  {
+   "name": "blend Lighten",
+   "group": "layers",
+   "value": "max",
+   "source": "PaintDotNet.Core.dll CompositionOps/Lighten.BlendComponent 0x0600124d"
+  },
+  {
+   "name": "blend Darken",
+   "group": "layers",
+   "value": "min",
+   "source": "PaintDotNet.Core.dll CompositionOps/Darken.BlendComponent 0x06001257"
+  },
+  {
+   "name": "blend Screen",
+   "group": "layers",
+   "value": "t+b-FastScale(t,b)",
+   "source": "PaintDotNet.Core.dll CompositionOps/Screen.BlendComponent 0x06001261"
+  },
+  {
+   "name": "blend Xor",
+   "group": "layers",
+   "value": "b^t",
+   "source": "PaintDotNet.Core.dll CompositionOps/Xor.BlendComponent 0x0600126b"
+  },
+  {
+   "name": "layer opacity",
+   "group": "layers",
+   "value": "scales top alpha with FastScale",
+   "estimated": true
+  },
+  {
+   "name": "brightness range",
+   "group": "brightness/contrast",
+   "value": "-100..100, default 0",
+   "source": "PaintDotNet.Effects.Legacy.dll BrightnessAndContrastAdjustment.OnCreatePropertyCollection 0x06000012"
+  },
+  {
+   "name": "contrast range",
+   "group": "brightness/contrast",
+   "value": "-100..100, default 0",
+   "source": "PaintDotNet.Effects.Legacy.dll BrightnessAndContrastAdjustment.OnCreatePropertyCollection 0x06000012"
+  },
+  {
+   "name": "contrast table",
+   "group": "brightness/contrast",
+   "value": "mul/div table, pivot 127, threshold 128",
+   "source": "PaintDotNet.Effects.Legacy.dll BrightnessAndContrastAdjustment.OnSetRenderInfo 0x06000014"
+  },
+  {
+   "name": "hue range",
+   "group": "hue/saturation",
+   "value": "-180..180, default 0",
+   "source": "PaintDotNet.Effects.Legacy.dll HueAndSaturationAdjustment.OnCreatePropertyCollection 0x060000fd"
+  },
+  {
+   "name": "saturation range",
+   "group": "hue/saturation",
+   "value": "0..200, default 100",
+   "source": "PaintDotNet.Effects.Legacy.dll HueAndSaturationAdjustment.OnCreatePropertyCollection 0x060000fd"
+  },
+  {
+   "name": "saturation stretch above 100",
+   "group": "hue/saturation",
+   "value": "(s-100)*3+100",
+   "source": "PaintDotNet.Effects.Legacy.dll HueAndSaturationAdjustment.OnSetRenderInfo 0x060000fe"
+  },
+  {
+   "name": "lightness range",
+   "group": "hue/saturation",
+   "value": "-100..100, default 0",
+   "source": "PaintDotNet.Effects.Legacy.dll HueAndSaturationAdjustment.OnCreatePropertyCollection 0x060000fd"
+  },
+  {
+   "name": "hue/saturation op",
+   "group": "hue/saturation",
+   "value": "intensity-relative saturation, sextant hue, lightness lerp table",
+   "source": "PaintDotNet.Core.dll HueSaturationLightness 0x0600113d/0x06001140/0x0600113f"
+  },
+  {
+   "name": "posterize levels",
+   "group": "posterize",
+   "value": "R,G,B 2..64 default 16, linked",
+   "source": "PaintDotNet.Effects.Legacy.dll PosterizeAdjustment.OnCreatePropertyCollection 0x06000201"
+  },
+  {
+   "name": "posterize table",
+   "group": "posterize",
+   "value": "CalcLevels stepping",
+   "source": "PaintDotNet.Effects.Legacy.dll PosterizePixelOp.CalcLevels 0x060002a6"
+  },
+  {
+   "name": "sepia gamma B,G,R",
+   "group": "sepia",
+   "value": "1.2, 1.0, 0.8",
+   "source": "PaintDotNet.Effects.Legacy.dll SepiaEffect.OnSetRenderInfo 0x0600022e (array at file 0x61330)"
+  },
+  {
+   "name": "level formula",
+   "group": "levels",
+   "value": "trunc(255*((v-lo)/(hi-lo))^gamma)",
+   "source": "PaintDotNet.Core.dll UnaryPixelOps.Level.Apply 0x06001161"
+  },
+  {
+   "name": "background layer name",
+   "group": "layers",
+   "value": "Background",
+   "source": "string table Layer.BackgroundLayer.DefaultName"
+  },
+  {
+   "name": "new image name",
+   "group": "files",
+   "value": "Untitled",
+   "source": "string table Untitled.FriendlyName"
+  },
+  {
+   "name": "tool count",
+   "group": "tools",
+   "value": 21,
+   "source": "string table *Tool.Name"
+  },
+  {
+   "name": "flood modes",
+   "group": "selection",
+   "value": "Contiguous, Global",
+   "source": "string table FloodMode.*"
+  },
+  {
+   "name": "new image size",
+   "group": "files",
+   "value": "800x600 landscape / 600x800 portrait, times UI scale",
+   "unit": "px",
+   "source": "paintdotnet.dll AppWorkspace.GetNewDocumentSize 0x06001421"
+  },
+  {
+   "name": "angle snap",
+   "group": "tools",
+   "value": 15,
+   "unit": "degrees",
+   "source": "paintdotnet.dll GradientToolChanges.ConstrainPoints 0x06001fd4 / ShapesToolChanges.ConstrainPoints15Degrees 0x06001d8f"
+  },
+  {
+   "name": "history steps kept",
+   "group": "history",
+   "value": "unlimited",
+   "source": "paintdotnet.dll HistoryStack.PushNewMemento 0x0600010e"
+  },
+  {
+   "name": "other effect formulas",
+   "group": "effects",
+   "value": "blurs, distort, noise, sharpen, vignette, clouds, emboss, edge detect, auto-level",
+   "estimated": true
+  },
+  {
+   "name": "history memory safety budget",
+   "group": "history",
+   "value": 1536,
+   "unit": "MB",
+   "estimated": true
+  }
+ ]
+}
