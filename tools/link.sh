@@ -120,5 +120,12 @@ sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/"/' "$ARGS" > "$ARGS.rsp"
 rm -f "$ARGS"
 status=0
 "$LLD" -flavor gnu "@$ARGS.rsp" || status=$?
+# the program's own file name (the argument after -o)
+OUT="$(sed -n '/^"-o"$/{n;p;q}' "$ARGS.rsp" | sed 's/^"//; s/"$//')"
 rm -f "$ARGS.rsp"
+# Programs linked here would otherwise need this sandbox's very new C library; point their few
+# too-new requests at the versions every x86_64 Linux system has (see tools/glibc_compat.py).
+if [ "$status" = 0 ] && [ "$shared" = 0 ] && [ -n "$OUT" ] && command -v python3 >/dev/null 2>&1; then
+  python3 -I "$(dirname "$0")/glibc_compat.py" "$OUT" "$LIBDIR" || true
+fi
 exit $status

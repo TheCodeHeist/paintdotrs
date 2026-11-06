@@ -1,0 +1,13 @@
+[package]
+name = "paint-rs-packager"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Builds the .deb and .rpm packages from the finished program (see ../package.sh).
+# Pure-Rust libraries only, so it works without a C compiler.
+[dependencies]
+ar = "0.9"
+tar = "0.4"
+flate2 = "1"
+rpm = { version = "0.30", default-features = false, features = ["gzip-compression", "payload"] }

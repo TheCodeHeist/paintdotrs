@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Paint.RS
+GenericName=Image Editor
+Comment=Layered image and photo editor
+Exec=paint-rs %F
+Icon=paint-rs
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+MimeType=image/png;image/jpeg;image/bmp;image/gif;image/tiff;image/webp;image/x-tga;image/qoi;
+Keywords=paint;draw;image;photo;editor;layers;
+StartupWMClass=paint-rs

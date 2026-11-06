@@ -1,0 +1,10 @@
+Paint.RS includes the following third-party parts built into the program:
+
+- Ubuntu Light font - Ubuntu Font Licence 1.0
+- Hack font - MIT License / Bitstream Vera License
+- Noto Emoji font - SIL Open Font License 1.1
+- Emoji icon font and egui icons - MIT License / SIL Open Font License 1.1
+  (fonts above are shipped with the egui user-interface library)
+- egui / eframe user-interface libraries - MIT OR Apache-2.0
+- image, png, flate2, ab_glyph, rayon and other Rust libraries - MIT and/or Apache-2.0
+  (see each library's own license at https://crates.io)
