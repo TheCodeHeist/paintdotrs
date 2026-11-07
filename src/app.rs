@@ -9,6 +9,10 @@ use eframe::egui::{self, pos2, vec2, Color32, Key, Pos2, Rect, Sense, Stroke, Te
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::mpsc;
+use crate::clip;
+
+mod freexf;
 
 pub const APP_NAME: &str = "Paint.RS";
 pub const DEFAULT_W: usize = 800;
@@ -29,10 +33,70 @@ pub const ZOOM_PRESETS: [f32; 45] = [
     1.0 / 4.0, 1.0 / 3.0, 1.0 / 2.0, 2.0 / 3.0, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0,
     20.0, 24.0, 28.0, 32.0, 40.0, 48.0, 56.0, 64.0, 76.0, 88.0, 100.0,
 ];
+/// Mouse wheel on the canvas (CanvasControl.ProcessVerticalPointerWheel, paintdotnet.dll 0x06002299).
+pub const WHEEL_ZOOM_FACTOR: f64 = 1.12; // zoom change per notch with Ctrl
+pub const WHEEL_ZOOM_SNAP: f64 = 0.05; // snap to a whole-number zoom within 5 %
+pub const WHEEL_SCROLL_PIXELS: f32 = 120.0; // screen pixels scrolled per notch (one Windows wheel notch = 120)
+/// Touchpads report pixels instead of notches; this many count as one notch (estimated).
+pub const WHEEL_PIXELS_PER_NOTCH: f32 = 50.0;
+/// Number boxes move by the system's "lines per wheel notch" (3 by default) steps per notch, and ignore
+/// the wheel while Shift or Alt is held (PdnNumericSpin.OnMouseWheel, PaintDotNet.Framework.dll 0x0600077f).
+pub const NUMBER_STEPS_PER_NOTCH: f64 = 3.0;
+
+/// Where a pasted picture goes, from the original's PasteImageAction.PerformActionImpl (paintdotnet.dll
+/// 0x060028f4): at the canvas corner if it fits in the visible part there; otherwise moved so it starts at
+/// the visible part's left/top edge, or ends at its right/bottom edge if it would stick out, never above 0.
+pub fn paste_origin(pw: usize, ph: usize, visible: Option<(usize, usize, usize, usize)>) -> (usize, usize) {
+    let Some((vx0, vy0, vx1, vy1)) = visible else { return (0, 0) };
+    let place = |size: usize, lo: usize, hi: usize| -> usize {
+        let mut p: i64 = 0;
+        if p < lo as i64 { p = lo as i64; }
+        if p + size as i64 > hi as i64 { p = hi as i64 - size as i64; }
+        p.max(0) as usize
+    };
+    (place(pw, vx0, vx1), place(ph, vy0, vy1))
+}
+
+/// Mouse wheel over a number box: change it by 3 steps per notch, like the original's number boxes.
+fn wheel_number<N: egui::emath::Numeric>(ui: &egui::Ui, resp: &egui::Response, value: &mut N, range: std::ops::RangeInclusive<N>, step: f64) -> bool {
+    if !resp.hovered() {
+        return false;
+    }
+    let notches: f32 = ui.input(|i| i.events.iter().filter_map(|e| match e {
+        egui::Event::MouseWheel { unit, delta, modifiers, .. } if !modifiers.shift && !modifiers.alt => Some(match unit {
+            egui::MouseWheelUnit::Point => delta.y / WHEEL_PIXELS_PER_NOTCH,
+            egui::MouseWheelUnit::Line => delta.y,
+            egui::MouseWheelUnit::Page => delta.y * 3.0,
+        }),
+        _ => None,
+    }).sum());
+    let steps = (notches as f64 * NUMBER_STEPS_PER_NOTCH).round();
+    if steps == 0.0 {
+        return false;
+    }
+    let v = (value.to_f64() + steps * step).clamp(range.start().to_f64(), range.end().to_f64());
+    *value = N::from_f64(v);
+    true
+}
+
+/// A number box (drag or type) that also follows the mouse wheel.
+fn num_box<N: egui::emath::Numeric>(ui: &mut egui::Ui, value: &mut N, range: std::ops::RangeInclusive<N>, step: f64, suffix: &str) -> egui::Response {
+    let mut resp = ui.add(egui::DragValue::new(value).range(range.clone()).speed(step * 0.3).max_decimals(if N::INTEGRAL { 0 } else { 2 }).suffix(suffix));
+    if wheel_number(ui, &resp, value, range, step) {
+        resp.mark_changed();
+    }
+    resp
+}
+
 /// Defaults from the original's settings sections (paintdotnet.dll AppSettings, see MECHANICS.md).
 pub const DEFAULT_BRUSH_SIZE: f32 = 2.0; // BrushSection "Size" 2 (1..2000)
 pub const DEFAULT_TOLERANCE: f32 = 0.5; // ToolsSection "Tolerance" 0.5 (0..1)
-pub const DEFAULT_FONT_SIZE: f32 = 12.0; // TextSection "FontSize" 12 (1..2000)
+pub const DEFAULT_FONT_SIZE: f32 = 12.0; // TextSection "FontSize" 12 (1..2000), in points
+/// Text sizes are points (TextSection "FontSizeMetric" default 0 = Points, paintdotnet.dll 0x06003575),
+/// drawn at the picture's resolution (TextTool.GetSizedFontProperties 0x06001cf4): pixels = points × DPI / 72.
+/// Pictures here use the original's default resolution of 96 DPI.
+pub const TEXT_DPI: f32 = 96.0;
+pub fn points_to_pixels(pt: f32) -> f32 { pt * TEXT_DPI / 72.0 }
 pub const DEFAULT_RADIUS: f32 = 10.0; // ShapesSection "Radius" 10 dips (0..2000)
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,7 +118,12 @@ pub struct Opts {
     pub sel_mode: SelMode,
     pub radius: f32,
     pub font_size: f32,
-    pub bold: bool,
+    /// Text tool font: family (None until the system fonts are scanned), weight (100..900) and italic
+    pub font_family: Option<String>,
+    pub font_weight: u16,
+    pub font_italic: bool,
+    /// Magic Wand / Paint Bucket compare colours of the whole picture instead of the active layer
+    pub sample_image: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -84,7 +153,11 @@ struct Drag {
 
 struct TextEdit { pos: (f32, f32), text: String, snap: Vec<Px>, color: Px, prev_rect: Option<(usize, usize, usize, usize)> }
 
-enum FileMode { Open, Save, ImportLayer }
+enum FileMode { Open, Save, Export, ImportLayer }
+
+/// Where a pasted picture goes (kept while a copied link downloads).
+#[derive(Clone, Copy)]
+enum PasteTarget { Layer, NewLayer, NewImage }
 
 enum Dialog {
     NewImage { w: u32, h: u32 },
@@ -95,6 +168,14 @@ enum Dialog {
     File { mode: FileMode, dir: PathBuf, name: String, ext: usize, err: String, entries: Vec<(String, bool)> },
     Confirm { doc: usize, then: AfterConfirm },
     Message(String),
+    /// painting on a smart object: turn it into ordinary pixels first?
+    Rasterize,
+    /// pasted picture bigger than the canvas: expand the canvas or keep its size
+    PasteBig { pic: clip::Picture, new_layer: bool },
+    /// files dropped on the window: open them or add them as layers (like the original)
+    DropChoice { items: Vec<PathBuf> },
+    /// the chosen file already exists
+    Overwrite { path: PathBuf, export: bool },
     About,
 }
 
@@ -121,10 +202,18 @@ pub struct App {
     text: Option<TextEdit>,
     clone_anchor: Option<(f32, f32)>,
     clipboard: Option<(usize, usize, Vec<Px>)>,
+    /// a copied selection outline (Edit > Copy Selection)
+    sel_clipboard: Option<(usize, usize, Vec<u8>)>,
+    /// selected pixels lifted for free transform (see freexf.rs)
+    floating: Option<freexf::Floating>,
+    /// a transform handle being dragged
+    xdrag: Option<freexf::XDrag>,
     dialog: Option<Dialog>,
     pixel_grid: bool,
     edit_secondary: bool,
     colors_more: bool,
+    /// search text in the font list
+    font_filter: String,
     hover: Option<(i32, i32)>,
     title: String,
     last_dir: PathBuf,
@@ -133,6 +222,12 @@ pub struct App {
     frame: u32,
     shot_done: Arc<AtomicBool>,
     allow_quit: bool,
+    sysclip: clip::SysClipboard,
+    download: Option<(mpsc::Receiver<Result<clip::Picture, String>>, PasteTarget)>,
+    /// short note shown in the status bar
+    status: String,
+    /// visible part of the picture (x0, y0, x1, y1), updated each frame
+    visible_img: Option<(usize, usize, usize, usize)>,
     dark: bool,
 }
 
@@ -236,13 +331,15 @@ impl App {
             .unwrap_or(false);
         apply_look(&cc.egui_ctx, dark);
 
+        // scan the system fonts for the Text tool while the window opens
+        crate::fonts::load_in_background();
         let mut app = App {
             docs: vec![],
             cur: 0,
             tool: Tool::Paintbrush,
             primary: [0, 0, 0, 255],
             secondary: [255, 255, 255, 255],
-            opts: Opts { brush: DEFAULT_BRUSH_SIZE, aa: true, fill: FillStyle::Outline, tol: DEFAULT_TOLERANCE, global: false, gradient: GradientKind::Linear, sel_mode: SelMode::Replace, radius: DEFAULT_RADIUS, font_size: DEFAULT_FONT_SIZE, bold: false },
+            opts: Opts { brush: DEFAULT_BRUSH_SIZE, aa: true, fill: FillStyle::Outline, tol: DEFAULT_TOLERANCE, global: false, gradient: GradientKind::Linear, sel_mode: SelMode::Replace, radius: DEFAULT_RADIUS, font_size: DEFAULT_FONT_SIZE, font_family: None, font_weight: 400, font_italic: false, sample_image: false },
             palette: default_palette(),
             tex: None,
             checker: None,
@@ -255,10 +352,14 @@ impl App {
             text: None,
             clone_anchor: None,
             clipboard: None,
+            sel_clipboard: None,
+            floating: None,
+            xdrag: None,
             dialog: None,
             pixel_grid: false,
             edit_secondary: false,
             colors_more: false,
+            font_filter: String::new(),
             hover: None,
             title: String::new(),
             last_dir: std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/")),
@@ -267,6 +368,10 @@ impl App {
             frame: 0,
             shot_done: Arc::new(AtomicBool::new(false)),
             allow_quit: false,
+            sysclip: clip::SysClipboard::new(),
+            download: None,
+            status: String::new(),
+            visible_img: None,
             dark,
         };
         for f in files {
@@ -418,6 +523,12 @@ impl App {
 
     fn begin_drag(&mut self, pos: (f32, f32), secondary: bool, mods: egui::Modifiers) {
         let tool = self.tool;
+        // tools that change pixels can't paint on a smart object until it's rasterized
+        let paints = matches!(tool, Tool::Paintbrush | Tool::Eraser | Tool::Pencil | Tool::CloneStamp | Tool::Recolor
+            | Tool::PaintBucket | Tool::Gradient | Tool::Line | Tool::Rectangle | Tool::RoundedRect | Tool::Ellipse | Tool::Text);
+        if paints && !(tool == Tool::CloneStamp && mods.ctrl) && self.smart_guard() {
+            return;
+        }
         let (w, h) = (self.docs[self.cur].w(), self.docs[self.cur].h());
         let inside = pos.0 >= 0.0 && pos.1 >= 0.0 && (pos.0 as usize) < w && (pos.1 as usize) < h;
         let (prim, sec) = if secondary { (self.secondary, self.primary) } else { (self.primary, self.secondary) };
@@ -457,7 +568,8 @@ impl App {
             }
             Tool::PaintBucket => {
                 if !inside { return; }
-                let mut m = raster::flood_mask(&d.layer().px, w, h, pos.0 as usize, pos.1 as usize, self.opts.tol, self.opts.global || mods.shift);
+                let sample = if self.opts.sample_image { d.composite() } else { d.layer().px.clone() };
+                let mut m = raster::flood_mask(&sample, w, h, pos.0 as usize, pos.1 as usize, self.opts.tol, self.opts.global || mods.shift);
                 if let Some(s) = &d.s.selection { for (a, b) in m.iter_mut().zip(s.iter()) { *a = (*a).min(*b); } }
                 let d = &mut self.docs[self.cur];
                 let a = d.s.active;
@@ -467,7 +579,11 @@ impl App {
             }
             Tool::MagicWand => {
                 if !inside { return; }
-                let m = raster::flood_mask(&d.layer().px, w, h, pos.0 as usize, pos.1 as usize, self.opts.tol, self.opts.global || mods.shift);
+                let m = if self.opts.sample_image {
+                    raster::flood_mask(&d.composite(), w, h, pos.0 as usize, pos.1 as usize, self.opts.tol, self.opts.global || mods.shift)
+                } else {
+                    raster::flood_mask(&d.layer().px, w, h, pos.0 as usize, pos.1 as usize, self.opts.tol, self.opts.global || mods.shift)
+                };
                 let mode = if mods.ctrl { SelMode::Union } else if mods.alt || secondary { SelMode::Exclude } else { self.opts.sel_mode };
                 let ns = self.combine_sel(&d.s.selection, m, mode);
                 let d = &mut self.docs[self.cur];
@@ -671,7 +787,8 @@ impl App {
 
     fn render_text_preview(&mut self, t: &mut TextEdit) {
         let (w, h) = (self.docs[self.cur].w(), self.docs[self.cur].h());
-        let cov = raster::text_coverage(w, h, &t.text, self.opts.font_size, t.pos.0, t.pos.1, self.opts.bold);
+        let font = self.text_font();
+        let cov = raster::text_coverage(w, h, &t.text, points_to_pixels(self.opts.font_size), t.pos.0, t.pos.1, font.as_ref().map(|(d, i)| (d.as_slice(), *i)));
         let mut prev = t.prev_rect;
         self.put_cov(&t.snap, &[(&cov, t.color)], &mut prev);
         t.prev_rect = prev;
@@ -696,14 +813,71 @@ impl App {
         d.zoom = nz;
     }
 
+    /// Set the zoom, keeping the picture point `around` (image coords) under the pointer.
+    fn zoom_to(&mut self, nz: f32, around: Option<(f32, f32)>) {
+        let nz = nz.clamp(ZOOM_PRESETS[0], ZOOM_PRESETS[ZOOM_PRESETS.len() - 1]);
+        let d = self.doc();
+        let z = d.zoom;
+        if let Some(p) = around {
+            let (cx, cy) = (d.w() as f32 / 2.0, d.h() as f32 / 2.0);
+            d.pan.0 += (p.0 - cx) * (z - nz);
+            d.pan.1 += (p.1 - cy) * (z - nz);
+        }
+        d.zoom = nz;
+    }
+
+    /// Ctrl+wheel zoom from the original's CanvasControl.ProcessVerticalPointerWheel (0x06002299):
+    /// factor 1.12 per notch; snap to the nearest whole-number zoom when within 5 % of it and closer to it
+    /// than the zoom before.
+    fn wheel_zoom(&mut self, notches: f32, around: Option<(f32, f32)>) {
+        let old = self.docs[self.cur].zoom as f64;
+        let factor = WHEEL_ZOOM_FACTOR.powf(notches.abs() as f64);
+        let mut new = if notches > 0.0 { old * factor } else { old / factor };
+        new = new.clamp(ZOOM_PRESETS[0] as f64, ZOOM_PRESETS[ZOOM_PRESETS.len() - 1] as f64);
+        let r = new.round(); // rounds halves away from zero, like the original
+        if (r - new).abs() < r * WHEEL_ZOOM_SNAP && (r - new).abs() < (r - old).abs() {
+            new = r;
+        }
+        self.zoom_to(new as f32, around);
+    }
+
     fn zoom_fit(&mut self) { self.doc().fit_pending = true; }
     fn actual_size(&mut self) { let d = self.doc(); d.zoom = 1.0; d.pan = (0.0, 0.0); }
 
     // ---------------- edit actions ----------------
 
-    fn select_all(&mut self) { let d = self.doc(); let n = d.w() * d.h(); d.s.selection = Some(vec![255; n]); d.commit("Select All"); }
-    fn deselect(&mut self) { let d = self.doc(); if d.s.selection.is_some() { d.s.selection = None; d.commit("Deselect"); } }
+    /// Edit > Copy Selection: remember just the selection's outline (not its pixels).
+    fn copy_selection(&mut self) {
+        let d = &self.docs[self.cur];
+        match &d.s.selection {
+            Some(m) => self.sel_clipboard = Some((d.w(), d.h(), m.clone())),
+            None => self.dialog = Some(Dialog::Message("There's no selection to copy.".into())),
+        }
+    }
+
+    /// Edit > Paste Selection: select the copied outline again, here or in another picture.
+    fn paste_selection(&mut self) {
+        let Some((sw, sh, m)) = self.sel_clipboard.clone() else {
+            self.dialog = Some(Dialog::Message("Copy a selection first (Edit > Copy Selection).".into()));
+            return;
+        };
+        let d = self.doc();
+        let (w, h) = (d.w(), d.h());
+        let mut nm = vec![0u8; w * h];
+        for y in 0..sh.min(h) { for x in 0..sw.min(w) { nm[y * w + x] = m[y * sw + x]; } }
+        d.s.selection = if nm.iter().any(|v| *v > 0) { Some(nm) } else { None };
+        d.commit("Paste Selection");
+    }
+
+    fn select_all(&mut self) { self.finish_floating(); let d = self.doc(); let n = d.w() * d.h(); d.s.selection = Some(vec![255; n]); d.commit("Select All"); }
+    fn deselect(&mut self) {
+        // floating pixels are only put down when they're deselected
+        if self.floating.is_some() { self.finish_floating(); }
+        let d = self.doc();
+        if d.s.selection.is_some() { d.s.selection = None; d.commit("Deselect"); }
+    }
     fn invert_selection(&mut self) {
+        self.finish_floating();
         let d = self.doc();
         let Some(m) = &d.s.selection else { return };
         let v: Vec<u8> = m.iter().map(|x| 255 - x).collect();
@@ -711,12 +885,16 @@ impl App {
         d.commit("Invert Selection");
     }
     fn erase_selection(&mut self) {
+        self.finish_floating();
+        if self.smart_guard() { return; }
         let d = self.doc();
         let Some(m) = d.s.selection.clone() else { return };
         for (p, mv) in d.layer_mut().px.iter_mut().zip(m.iter()) { p[3] = (p[3] as u32 * (255 - *mv as u32) / 255) as u8; }
         d.commit("Erase Selection");
     }
     fn fill_selection(&mut self) {
+        self.finish_floating();
+        if self.smart_guard() { return; }
         let col = self.primary;
         let d = self.doc();
         let n = d.w() * d.h();
@@ -725,6 +903,7 @@ impl App {
         d.commit("Fill Selection");
     }
     fn copy(&mut self, merged: bool) {
+        self.finish_floating();
         let d = &self.docs[self.cur];
         let (w, h) = (d.w(), d.h());
         let (x0, y0, x1, y1) = Self::sel_bounds(d).unwrap_or((0, 0, w, h));
@@ -736,54 +915,172 @@ impl App {
             p[3] = (p[3] as u32 * d.sel_at(i) as u32 / 255) as u8;
             out.push(p);
         } }
+        // also on the system clipboard, so it pastes into other pictures, other copies of the app and other programs
+        self.sysclip.put(x1 - x0, y1 - y0, &out);
         self.clipboard = Some((x1 - x0, y1 - y0, out));
+    }
+
+    /// The picture to paste: the system clipboard first (other programs, other windows), then our own copy.
+    /// A copied web link starts a download and pastes when it arrives.
+    fn clipboard_picture(&mut self, purpose: PasteTarget) -> Option<clip::Picture> {
+        match self.sysclip.offer() {
+            clip::Offer::Picture(p) => Some(p),
+            clip::Offer::Link(url) => {
+                self.download = Some((clip::download(url.clone()), purpose));
+                self.status = format!("Downloading the copied picture from {url}…");
+                None
+            }
+            clip::Offer::Nothing => match self.clipboard.clone() {
+                Some((w, h, px)) => Some(clip::Picture { w, h, px }),
+                None => {
+                    self.dialog = Some(Dialog::Message("There's nothing to paste yet. Copy a picture first.".into()));
+                    None
+                }
+            },
+        }
+    }
+
+    fn paste(&mut self, new_layer: bool) {
+        let target = if new_layer { PasteTarget::NewLayer } else { PasteTarget::Layer };
+        if let Some(pic) = self.clipboard_picture(target) {
+            self.paste_picture(pic, new_layer);
+        }
+    }
+
+    /// Paste, first asking what to do when the picture is bigger than the canvas.
+    fn paste_picture(&mut self, pic: clip::Picture, new_layer: bool) {
+        let d = &self.docs[self.cur];
+        if pic.w > d.w() || pic.h > d.h() {
+            self.dialog = Some(Dialog::PasteBig { pic, new_layer });
+        } else {
+            self.paste_into(pic, new_layer, false);
+        }
+    }
+
+    fn paste_into(&mut self, pic: clip::Picture, new_layer: bool, expand: bool) {
+        if expand {
+            let bg = self.secondary;
+            let d = self.doc();
+            let (w0, h0) = (d.w(), d.h());
+            let (nw, nh) = (w0.max(pic.w), h0.max(pic.h));
+            for (i, l) in d.s.layers.iter_mut().enumerate() {
+                if l.smart.is_some() { l.rerender(nw, nh); continue; }
+                let fill = if i == 0 && l.name == "Background" { bg } else { [0, 0, 0, 0] };
+                l.px = raster::recanvas(&l.px, w0, h0, nw, nh, 0, 0, fill);
+            }
+            d.s.w = nw;
+            d.s.h = nh;
+            d.s.selection = None;
+            d.commit("Expand Canvas");
+            self.zoom_fit();
+        }
+        // The pasted picture floats with the transform handles on, keeping every pixel even where the canvas
+        // hides it; it becomes ordinary pixels when deselected (parts past the canvas edge stay a smart object).
+        let (ox, oy) = paste_origin(pic.w, pic.h, self.visible_img);
+        self.float_picture(pic, if new_layer { "Paste into New Layer" } else { "Paste" }, (ox, oy), new_layer);
+    }
+
+    fn paste_new_image(&mut self) {
+        if let Some(pic) = self.clipboard_picture(PasteTarget::NewImage) {
+            self.new_image_from(pic);
+        }
+    }
+
+    fn new_image_from(&mut self, pic: clip::Picture) {
+        let mut d = Document::new("Untitled", pic.w, pic.h, [0, 0, 0, 0]);
+        d.s.layers[0].px = pic.px;
+        d.history[0] = crate::doc::HistoryItem::first("New Image", &d.s);
+        self.docs.push(d);
+        self.cur = self.docs.len() - 1;
+    }
+
+    /// File > New: the copied picture's size when there is one, otherwise the original's default size.
+    fn open_new_dialog(&mut self, ctx: &egui::Context) {
+        let (w, h) = match self.sysclip.offer() {
+            clip::Offer::Picture(p) => (p.w as u32, p.h as u32),
+            _ => match &self.clipboard {
+                Some((w, h, _)) => (*w as u32, *h as u32),
+                None => new_image_size(ctx),
+            },
+        };
+        self.dialog = Some(Dialog::NewImage { w, h });
+    }
+
+    /// Open dropped items in their own tabs, or add them as layers of the current picture.
+    fn handle_drop(&mut self, items: Vec<PathBuf>, as_layers: bool) {
+        for p in items {
+            let text = p.to_string_lossy().into_owned();
+            if text.starts_with("http://") || text.starts_with("https://") {
+                self.download = Some((clip::download(text.clone()), if as_layers { PasteTarget::NewLayer } else { PasteTarget::NewImage }));
+                self.status = format!("Downloading the dropped picture from {text}…");
+            } else if text.starts_with("data:") {
+                match clip::decode_data_url(&text) {
+                    Ok(pic) if as_layers => self.paste_picture(pic, true),
+                    Ok(pic) => self.new_image_from(pic),
+                    Err(e) => self.dialog = Some(Dialog::Message(e)),
+                }
+            } else if as_layers {
+                if let Err(e) = self.import_layer(&p) { self.dialog = Some(Dialog::Message(format!("Couldn't open {}: {e}", io::file_name(&p)))); }
+            } else {
+                self.open_path(p);
+            }
+        }
+    }
+
+    /// Finish a background download of a copied picture link.
+    fn poll_download(&mut self) {
+        let Some((rx, target)) = &self.download else { return };
+        let target = *target;
+        match rx.try_recv() {
+            Ok(Ok(pic)) => {
+                self.download = None;
+                self.status.clear();
+                match target {
+                    PasteTarget::Layer => self.paste_picture(pic, false),
+                    PasteTarget::NewLayer => self.paste_picture(pic, true),
+                    PasteTarget::NewImage => self.new_image_from(pic),
+                }
+            }
+            Ok(Err(e)) => {
+                self.download = None;
+                self.status.clear();
+                self.dialog = Some(Dialog::Message(e));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => { self.download = None; self.status.clear(); }
+        }
     }
     fn cut(&mut self) {
         self.copy(false);
+        if self.docs[self.cur].layer().smart.is_some() {
+            // cutting a whole smart object removes the layer; cutting part of it needs ordinary pixels
+            if self.docs[self.cur].s.selection.is_none() { self.delete_layer(); } else { self.smart_guard(); }
+            return;
+        }
         let d = self.doc();
         if d.s.selection.is_none() {
             for p in d.layer_mut().px.iter_mut() { p[3] = 0; }
             d.commit("Cut");
         } else { self.erase_selection(); }
     }
-    fn paste(&mut self, new_layer: bool) {
-        let Some((cw, ch, cpx)) = self.clipboard.clone() else { self.dialog = Some(Dialog::Message("There's nothing to paste yet. Copy something first.".into())); return };
-        if new_layer { self.add_layer(false); }
-        let d = self.doc();
-        let (w, h) = (d.w(), d.h());
-        let mut mask = vec![0u8; w * h];
-        let a = d.s.active;
-        for y in 0..ch.min(h) { for x in 0..cw.min(w) {
-            let p = cpx[y * cw + x];
-            let i = y * w + x;
-            d.s.layers[a].px[i] = over(d.s.layers[a].px[i], p, 255);
-            mask[i] = 255;
-        } }
-        d.s.selection = Some(mask);
-        d.commit(if new_layer { "Paste into New Layer" } else { "Paste" });
-        self.tool = Tool::MovePixels;
-        if cw > w || ch > h {
-            self.dialog = Some(Dialog::Message("The pasted picture is bigger than the canvas, so its edges were cut off. Use Image > Canvas Size to make room.".into()));
-        }
-    }
-    fn paste_new_image(&mut self) {
-        let Some((cw, ch, cpx)) = self.clipboard.clone() else { self.dialog = Some(Dialog::Message("There's nothing to paste yet. Copy something first.".into())); return };
-        let mut d = Document::new("Untitled", cw, ch, [0, 0, 0, 0]);
-        d.s.layers[0].px = cpx;
-        d.history[0] = crate::doc::HistoryItem::first("New Image", &d.s);
-        self.docs.push(d);
-        self.cur = self.docs.len() - 1;
-    }
 
     // ---------------- image & layer actions ----------------
 
     fn crop_to_selection(&mut self) {
+        self.finish_floating();
         let Some((x0, y0, x1, y1)) = Self::sel_bounds(&self.docs[self.cur]) else { return };
         let d = self.doc();
         let w = d.w();
         let (nw, nh) = (x1 - x0, y1 - y0);
         let m = d.s.selection.clone().unwrap();
         for l in d.s.layers.iter_mut() {
+            // smart objects keep everything: the canvas just moves over them
+            if let Some(s) = l.smart.as_mut() {
+                s.xf.cx -= x0 as f32;
+                s.xf.cy -= y0 as f32;
+                l.rerender(nw, nh);
+                continue;
+            }
             let mut o = Vec::with_capacity(nw * nh);
             for y in y0..y1 { for x in x0..x1 { let mut p = l.px[y * w + x]; p[3] = (p[3] as u32 * m[y * w + x] as u32 / 255) as u8; o.push(p); } }
             l.px = o;
@@ -793,9 +1090,22 @@ impl App {
         self.zoom_fit();
     }
     fn image_transform(&mut self, what: &str) {
+        self.finish_floating();
         let d = self.doc();
         let (w, h) = (d.w(), d.h());
         for l in d.s.layers.iter_mut() {
+            if let Some(s) = l.smart.as_mut() {
+                let (nw, nh) = if what.starts_with("Rotate 90") { (h, w) } else { (w, h) };
+                match what {
+                    "Flip Horizontal" => crate::smart::flip(&mut s.xf, w, h, true),
+                    "Flip Vertical" => crate::smart::flip(&mut s.xf, w, h, false),
+                    "Rotate 180°" => { crate::smart::flip(&mut s.xf, w, h, true); crate::smart::flip(&mut s.xf, w, h, false); }
+                    "Rotate 90° Clockwise" => crate::smart::rot90(&mut s.xf, w, h),
+                    _ => { crate::smart::rot90(&mut s.xf, w, h); crate::smart::rot90(&mut s.xf, h, w); crate::smart::rot90(&mut s.xf, w, h); }
+                }
+                l.rerender(nw, nh);
+                continue;
+            }
             match what {
                 "Flip Horizontal" => raster::flip_h(&mut l.px, w, h),
                 "Flip Vertical" => raster::flip_v(&mut l.px, w, h),
@@ -809,13 +1119,25 @@ impl App {
         d.commit(what);
     }
     fn layer_transform(&mut self, what: &str) {
+        self.finish_floating();
         let d = self.doc();
         let (w, h) = (d.w(), d.h());
         let l = d.layer_mut();
+        if let Some(s) = l.smart.as_mut() {
+            match what {
+                "Flip Layer Horizontal" => crate::smart::flip(&mut s.xf, w, h, true),
+                "Flip Layer Vertical" => crate::smart::flip(&mut s.xf, w, h, false),
+                _ => { crate::smart::flip(&mut s.xf, w, h, true); crate::smart::flip(&mut s.xf, w, h, false); }
+            }
+            l.rerender(w, h);
+            d.commit(what);
+            return;
+        }
         match what { "Flip Layer Horizontal" => raster::flip_h(&mut l.px, w, h), "Flip Layer Vertical" => raster::flip_v(&mut l.px, w, h), _ => raster::rot180(&mut l.px) }
         d.commit(what);
     }
     fn flatten(&mut self) {
+        self.finish_floating();
         let d = self.doc();
         if d.s.layers.len() < 2 { return; }
         let flat = d.composite();
@@ -826,6 +1148,7 @@ impl App {
         d.commit("Flatten");
     }
     fn add_layer(&mut self, commit: bool) {
+        self.finish_floating();
         let d = self.doc();
         let n = d.s.layers.len() + 1;
         let l = Layer::new(&format!("Layer {n}"), d.w(), d.h(), [0, 0, 0, 0]);
@@ -835,6 +1158,7 @@ impl App {
         if commit { d.commit("Add New Layer"); }
     }
     fn delete_layer(&mut self) {
+        self.finish_floating();
         let d = self.doc();
         if d.s.layers.len() < 2 { return; }
         d.s.layers.remove(d.s.active);
@@ -842,6 +1166,7 @@ impl App {
         d.commit("Delete Layer");
     }
     fn duplicate_layer(&mut self) {
+        self.finish_floating();
         let d = self.doc();
         let mut l = d.layer().clone();
         l.name = format!("{} copy", l.name);
@@ -851,9 +1176,12 @@ impl App {
         d.commit("Duplicate Layer");
     }
     fn merge_down(&mut self) {
+        self.finish_floating();
         let d = self.doc();
         let a = d.s.active;
         if a == 0 { return; }
+        // merging into a smart object makes it ordinary pixels
+        d.s.layers[a - 1].smart = None;
         let top = d.s.layers[a].clone();
         if top.visible {
             for (b, t) in d.s.layers[a - 1].px.iter_mut().zip(top.px.iter()) { *b = top.blend.blend(*b, *t, top.opacity); }
@@ -863,26 +1191,27 @@ impl App {
         d.commit("Merge Layer Down");
     }
     fn move_layer(&mut self, up: bool) {
+        self.finish_floating();
         let d = self.doc();
         let a = d.s.active;
         if up && a + 1 < d.s.layers.len() { d.s.layers.swap(a, a + 1); d.s.active = a + 1; d.commit("Move Layer Up"); }
         else if !up && a > 0 { d.s.layers.swap(a, a - 1); d.s.active = a - 1; d.commit("Move Layer Down"); }
     }
     fn import_layer(&mut self, path: &std::path::Path) -> Result<(), String> {
+        // an imported picture floats on a new layer like a paste: nothing is cut off, even if it's bigger
         let (iw, ih, ipx) = io::load_pixels(path)?;
-        self.add_layer(false);
+        self.float_picture(clip::Picture { w: iw, h: ih, px: ipx }, "Import From File", (0, 0), true);
+        let name = io::file_name(path);
         let d = self.doc();
-        let (w, h) = (d.w(), d.h());
-        let px = raster::recanvas(&ipx, iw, ih, w, h, 0, 0, [0, 0, 0, 0]);
-        let l = d.layer_mut();
-        l.px = px;
-        l.name = io::file_name(path);
-        d.commit("Import From File");
+        let a = d.s.active;
+        d.s.layers[a].name = name;
         Ok(())
     }
 
     fn start_effect(&mut self, fx: Fx) {
         if self.dialog.is_some() { return; }
+        self.finish_floating();
+        if self.smart_guard() { return; }
         let vals: Vec<f32> = fx.params().iter().map(|p| p.default).collect();
         let snap = self.docs[self.cur].layer().px.clone();
         self.run_effect(fx, &vals, &snap);
@@ -910,29 +1239,42 @@ impl App {
     // ---------------- files ----------------
 
     fn open_file_dialog(&mut self, mode: FileMode) {
-        let dir = self.docs.get(self.cur).and_then(|d| d.path.as_ref()).and_then(|p| p.parent().map(|p| p.to_path_buf())).unwrap_or_else(|| self.last_dir.clone());
-        let name = match mode {
-            FileMode::Save => {
-                let n = &self.docs[self.cur].name;
-                std::path::Path::new(n).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into())
+        self.finish_floating();
+        let d = &self.docs[self.cur];
+        let known = d.path.as_ref().or(d.source.as_ref());
+        let dir = known.and_then(|p| p.parent().map(|p| p.to_path_buf())).unwrap_or_else(|| self.last_dir.clone());
+        let stem = std::path::Path::new(&d.name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into());
+        let (name, ext) = match mode {
+            FileMode::Save => (stem, 0),
+            FileMode::Export => {
+                // default to the format it came in, as a new file next to it
+                let ext = d.source.as_ref().and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_lowercase())
+                    .map(|e| if e == "jpeg" { "jpg".to_string() } else if e == "tif" { "tiff".to_string() } else { e })
+                    .and_then(|e| io::EXPORT_EXTS.iter().position(|x| *x == e)).unwrap_or(0);
+                (Self::free_copy_name(&dir, &stem, io::EXPORT_EXTS[ext]), ext)
             }
-            _ => String::new(),
-        };
-        let ext = match mode {
-            FileMode::Save => self.docs[self.cur].path.as_ref().and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_lowercase())
-                .and_then(|e| io::SAVE_EXTS.iter().position(|x| *x == e)).unwrap_or(0),
-            _ => 0,
+            _ => (String::new(), 0),
         };
         let mut dlg = Dialog::File { mode, dir, name, ext, err: String::new(), entries: vec![] };
         Self::refresh_entries(&mut dlg);
         self.dialog = Some(dlg);
     }
 
+    /// "name copy", "name copy 2"... that doesn't exist yet in `dir`.
+    fn free_copy_name(dir: &std::path::Path, stem: &str, ext: &str) -> String {
+        let mut n = 1;
+        loop {
+            let name = if n == 1 { format!("{stem} copy") } else { format!("{stem} copy {n}") };
+            if !dir.join(format!("{name}.{ext}")).exists() { return name; }
+            n += 1;
+        }
+    }
+
     fn refresh_entries(dlg: &mut Dialog) {
         if let Dialog::File { dir, entries, mode, .. } = dlg {
             entries.clear();
             if let Ok(rd) = std::fs::read_dir(&dir) {
-                let exts: &[&str] = match mode { FileMode::Save => io::SAVE_EXTS, _ => io::OPEN_EXTS };
+                let exts: &[&str] = match mode { FileMode::Save => &["pxe"], FileMode::Export => io::EXPORT_EXTS, _ => io::OPEN_EXTS };
                 let mut v: Vec<(String, bool)> = rd.flatten().filter_map(|e| {
                     let name = e.file_name().to_string_lossy().into_owned();
                     if name.starts_with('.') { return None; }
@@ -946,7 +1288,8 @@ impl App {
         }
     }
 
-    fn do_save(&mut self, path: PathBuf) -> Result<(), String> {
+    /// Save the layered project (.pxe). This is the only kind of file Save writes.
+    fn save_project(&mut self, path: PathBuf) -> Result<(), String> {
         let q = self.jpeg_quality;
         io::save(&self.docs[self.cur], &path, q)?;
         let d = self.doc();
@@ -957,9 +1300,20 @@ impl App {
         Ok(())
     }
 
+    /// Export a flat copy. The picture keeps its project file and stays marked as unsaved if it was.
+    fn export_copy(&mut self, path: PathBuf) -> Result<(), String> {
+        let q = self.jpeg_quality;
+        io::save(&self.docs[self.cur], &path, q)?;
+        if let Some(p) = path.parent() { self.last_dir = p.to_path_buf(); }
+        self.status.clear();
+        Ok(())
+    }
+
+    /// Save: back into its own project file, or ask where to keep the project. Never overwrites the
+    /// PNG/JPG a picture was opened from (use Export for that, which asks first).
     fn save(&mut self) {
         match self.docs[self.cur].path.clone() {
-            Some(p) => { if let Err(e) = self.do_save(p) { self.dialog = Some(Dialog::Message(format!("Couldn't save: {e}"))); } }
+            Some(p) => { if let Err(e) = self.save_project(p) { self.dialog = Some(Dialog::Message(format!("Couldn't save: {e}"))); } }
             None => self.open_file_dialog(FileMode::Save),
         }
     }
@@ -999,23 +1353,42 @@ impl App {
                 egui::Event::Copy if !typing => self.copy(false),
                 egui::Event::Cut if !typing => self.cut(),
                 egui::Event::Paste(_) if !typing => self.paste(false),
+                // Ctrl+V with only a picture on the clipboard arrives as an image, not as a text paste
+                egui::Event::PasteImage(img) if !typing => {
+                    let px: Vec<Px> = img.pixels.iter().map(|c| c.to_srgba_unmultiplied()).collect();
+                    let pic = clip::Picture { w: img.size[0], h: img.size[1], px };
+                    if pic.w > 0 && pic.h > 0 { self.paste_picture(pic, false); } else { self.paste(false); }
+                }
                 egui::Event::Key { key, pressed: true, modifiers, .. } => {
                     let (c, s) = (modifiers.command, modifiers.shift);
                     if typing { continue; }
                     match (*key, c, s) {
-                        (Key::Z, true, false) => self.doc().undo(),
-                        (Key::Y, true, _) | (Key::Z, true, true) => self.doc().redo(),
+                        // Edit menu keys from the original's EditMenu..ctor (paintdotnet.dll 0x06000abc)
+                        (Key::C, true, true) if modifiers.alt => self.copy_selection(),
+                        (Key::V, true, true) if modifiers.alt => self.paste_selection(),
+                        (Key::C, true, false) => self.copy(false),
+                        (Key::C, true, true) => self.copy(true),
+                        (Key::X, true, false) => self.cut(),
+                        (Key::V, true, false) if modifiers.alt => self.paste_new_image(),
+                        (Key::V, true, false) => self.paste(false),
+                        (Key::V, true, true) => self.paste(true),
+                        // undo while pixels float puts them back first
+                        // undo/redo step through a floating picture's transforms first
+                        (Key::Z, true, false) => self.undo(),
+                        (Key::Y, true, _) | (Key::Z, true, true) => self.redo(),
+                        (Key::Enter, false, _) => self.finish_floating(),
                         (Key::A, true, false) => self.select_all(),
                         (Key::D, true, false) => self.deselect(),
                         (Key::I, true, false) => self.invert_selection(),
                         (Key::I, true, true) => self.start_effect(Fx::InvertColors),
                         (Key::G, true, true) => self.start_effect(Fx::BlackAndWhite),
                         (Key::E, true, true) => self.start_effect(Fx::Sepia),
-                        (Key::N, true, false) => { let (w, h) = new_image_size(ctx); self.dialog = Some(Dialog::NewImage { w, h }) }
+                        (Key::N, true, false) => self.open_new_dialog(ctx),
                         (Key::N, true, true) => self.add_layer(true),
                         (Key::O, true, false) => self.open_file_dialog(FileMode::Open),
                         (Key::S, true, false) => self.save(),
                         (Key::S, true, true) => self.open_file_dialog(FileMode::Save),
+                        (Key::E, true, false) => self.open_file_dialog(FileMode::Export),
                         (Key::W, true, false) => { let c = self.cur; self.close_doc(c, false) }
                         (Key::D, true, true) => self.duplicate_layer(),
                         (Key::M, true, false) => self.merge_down(),
@@ -1032,7 +1405,10 @@ impl App {
                         (Key::Delete, false, _) => self.erase_selection(),
                         (Key::Backspace, false, _) => self.fill_selection(),
                         (Key::X, false, false) => std::mem::swap(&mut self.primary, &mut self.secondary),
-                        (Key::Escape, false, _) => { if self.text.is_some() { self.finish_text(); } else { self.deselect(); } }
+                        (Key::Escape, false, _) => {
+                            if self.text.is_some() { self.finish_text(); }
+                            else if !self.cancel_floating() { self.deselect(); }
+                        }
                         (Key::OpenBracket, false, _) => self.opts.brush = (self.opts.brush - 1.0).max(1.0),
                         (Key::CloseBracket, false, _) => self.opts.brush = (self.opts.brush + 1.0).min(2000.0),
                         (k, false, false) => {
@@ -1053,18 +1429,146 @@ impl App {
 
     fn set_tool(&mut self, t: Tool) {
         if self.tool == Tool::Text && t != Tool::Text { self.finish_text(); }
+        if t != Tool::MovePixels { self.finish_floating(); }
         self.tool = t;
     }
 }
+
+#[cfg(test)]
+pub fn free_copy_name_for_tests(dir: &std::path::Path, stem: &str, ext: &str) -> String { App::free_copy_name(dir, stem, ext) }
 
 // =====================================================================
 // UI
 // =====================================================================
 
 impl eframe::App for App {
+    /// Ctrl+C/X/V reach the app as keys (clipboard_shortcuts is off). While a text box has focus, turn them
+    /// back into text copy/cut/paste so text editing works as usual.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if !ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let mut out = Vec::with_capacity(raw.events.len());
+        for ev in raw.events.drain(..) {
+            match &ev {
+                egui::Event::Key { key: Key::C, pressed: true, modifiers, .. } if modifiers.command => out.push(egui::Event::Copy),
+                egui::Event::Key { key: Key::X, pressed: true, modifiers, .. } if modifiers.command => out.push(egui::Event::Cut),
+                egui::Event::Key { key: Key::V, pressed: true, modifiers, .. } if modifiers.command => {
+                    if let Some(t) = self.sysclip.text() { out.push(egui::Event::Paste(t)); }
+                }
+                _ => out.push(ev),
+            }
+        }
+        raw.events = out;
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.frame += 1;
+
+        // Diagnostics for the system clipboard (PAINT_RS_SELFTEST=copy | paste:<report file>):
+        // "copy" puts a 37 x 23 test picture on the clipboard and stays open 15 s; "paste" reads the
+        // clipboard after a moment, writes what it found to the report file and quits.
+        if let Ok(mode) = std::env::var("PAINT_RS_SELFTEST") {
+            ctx.request_repaint();
+            if mode == "copy" {
+                if self.frame == 20 {
+                    let px: Vec<Px> = (0..37 * 23).map(|i| [200, (i % 37 * 6) as u8, 40, 255]).collect();
+                    self.sysclip.put(37, 23, &px);
+                }
+                if self.frame > 900 { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+            } else if let Some(out) = mode.strip_prefix("fonts:") {
+                // font picker check: system fonts found, default chosen, text drawn with it
+                if let Some(cat) = crate::fonts::catalog() {
+                    if self.frame < 1000 {
+                        self.frame = 1000;
+                        let fam = cat.default_family();
+                        let faces = fam.as_deref().and_then(|f| cat.faces(f)).map(|f| f.len()).unwrap_or(0);
+                        let font = self.text_font();
+                        let (w, h) = (400, 100);
+                        let cov = raster::text_coverage(w, h, "Paint.RS", 40.0, 5.0, 5.0, font.as_ref().map(|(d, i)| (d.as_slice(), *i)));
+                        let inked = cov.c.iter().filter(|v| **v > 0).count();
+                        let r = format!("families={} default={fam:?} faces={faces} font_loaded={} inked_pixels={inked}\n", cat.families.len(), font.is_some());
+                        let _ = std::fs::write(out, r);
+                    }
+                }
+                if self.frame > 1005 || self.frame > 900 && crate::fonts::catalog().is_none() { self.allow_quit = true; ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+            } else if let Some(out) = mode.strip_prefix("transform:") {
+                // free transform check: paste, move, deselect; inside → pixels, partly outside → smart object kept
+                if self.frame == 10 {
+                    let mut r = String::new();
+                    let red = || clip::Picture { w: 100, h: 50, px: vec![[220, 30, 30, 255]; 100 * 50] };
+                    // 1. paste fully inside, move it, put it down
+                    self.float_picture(red(), "Paste", (0, 0), false);
+                    r += &format!("handles after paste: {}\n", self.xform_target().is_some());
+                    let mut xf = self.xform_target().unwrap().0;
+                    xf.cx += 200.0; xf.cy += 100.0;
+                    self.apply_xform(xf);
+                    self.deselect();
+                    let d = &self.docs[self.cur];
+                    r += &format!("inside: layers={} pixel(250,125)={:?} smart={}\n", d.s.layers.len(), d.s.layers[0].px[125 * d.w() + 250], d.s.layers.iter().any(|l| l.smart.is_some()));
+                    // 2. paste, push half of it past the left edge, put it down
+                    self.float_picture(red(), "Paste", (0, 0), false);
+                    let mut xf = self.xform_target().unwrap().0;
+                    xf.cx -= 50.0; xf.angle = 0.3;
+                    self.apply_xform(xf);
+                    self.deselect();
+                    let d = &self.docs[self.cur];
+                    let s = d.s.layers.iter().find_map(|l| l.smart.as_ref());
+                    r += &format!("outside: layers={} smart_kept={} source={:?}\n", d.s.layers.len(), s.is_some(), s.map(|s| (s.sw, s.sh)));
+                    // 3. moving the smart object back shows the hidden half again
+                    if s.is_some() {
+                        let mut xf = self.xform_target().unwrap().0;
+                        xf.cx += 300.0; xf.angle = 0.0;
+                        self.apply_xform(xf);
+                        let d = &self.docs[self.cur];
+                        let l = d.layer();
+                        let shown = l.px.iter().filter(|p| p[3] > 0).count();
+                        r += &format!("moved back: visible pixels={shown} (expect 5000)\n");
+                    }
+                    // 4. undo goes back step by step
+                    let before = self.docs[self.cur].hist_pos;
+                    self.doc().undo();
+                    r += &format!("history steps={} undo ok={}\n", before, self.docs[self.cur].hist_pos + 1 == before);
+                    // 5. while a paste floats, undo/redo step through its transforms; the paste stays
+                    self.float_picture(red(), "Paste", (0, 0), false);
+                    let start = self.xform_target().unwrap();
+                    for dx in [100.0f32, 200.0] {
+                        let (xf0, sw, sh) = self.xform_target().unwrap();
+                        self.xdrag = Some(freexf::XDrag { grip: crate::smart::Grip::Move, start: (0.0, 0.0), xf0, sw, sh });
+                        let mut xf = xf0;
+                        xf.cx = start.0.cx + dx;
+                        self.apply_xform(xf);
+                        self.xform_release();
+                    }
+                    let cx = |s: &Self| s.xform_target().map(|t| t.0.cx - start.0.cx);
+                    let after2 = cx(self);
+                    self.undo();
+                    let after_undo1 = cx(self);
+                    self.undo();
+                    let after_undo2 = cx(self);
+                    self.redo();
+                    let after_redo = cx(self);
+                    self.undo();
+                    self.undo();
+                    let after_undo3 = cx(self);
+                    r += &format!("float steps: moved={after2:?} undo={after_undo1:?} undo={after_undo2:?} redo={after_redo:?} undo past paste={after_undo3:?} (expect 200, 100, 0, 100, None)\n");
+                    let _ = std::fs::write(out, r);
+                }
+                if self.frame > 15 { self.allow_quit = true; ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+            } else if let Some(out) = mode.strip_prefix("paste:") {
+                if self.frame == 90 {
+                    let types = winit::platform::wayland::clipboard::types();
+                    let report = match self.sysclip.offer() {
+                        clip::Offer::Picture(p) => format!("picture {}x{} first={:?} types={types:?}", p.w, p.h, p.px.first()),
+                        clip::Offer::Link(u) => format!("link {u} types={types:?}"),
+                        clip::Offer::Nothing => format!("nothing types={types:?} wayland={}", winit::platform::wayland::clipboard::available()),
+                    };
+                    let _ = std::fs::write(out, report);
+                }
+                if self.frame > 100 { self.allow_quit = true; ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+            }
+        }
 
         // screenshot mode: draw ~120 frames, save the window, quit
         if let Some(path) = self.shot.clone() {
@@ -1096,10 +1600,29 @@ impl eframe::App for App {
         }
 
         // files dropped onto the window
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
-        for p in dropped { self.open_path(p); }
+        // Anything dropped on the window opens in its own tab: picture files, and pictures dragged from a
+        // web browser (an address to download, or a picture embedded in the page as data:).
+        // Holding Shift adds them as layers of the current picture instead (the original's other drop
+        // choice, "add layers", from MainForm.OnDragDropImpl, paintdotnet.dll 0x06001146).
+        let (dropped, as_layers): (Vec<PathBuf>, bool) = ctx.input(|i| (i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect(), i.modifiers.shift));
+        // Like the original (MainForm.OnDragDropImpl, 0x06001146): folders are skipped; one picture with no
+        // picture open opens straight away; otherwise ask "Open" (each in its own tab) or "Add layers".
+        // Our additions: pictures from web browsers, and Shift+drop = add layers without asking.
+        let dropped: Vec<PathBuf> = dropped.into_iter().filter(|p| !p.is_dir()).collect();
+        if !dropped.is_empty() {
+            let nothing_open = self.docs.len() == 1 && self.docs[0].path.is_none() && self.docs[0].source.is_none() && !self.docs[0].dirty && self.docs[0].hist_pos == 0;
+            if as_layers {
+                self.handle_drop(dropped, true);
+            } else if dropped.len() == 1 && nothing_open {
+                self.handle_drop(dropped, false);
+            } else {
+                self.dialog = Some(Dialog::DropChoice { items: dropped });
+            }
+        }
 
         self.shortcuts(&ctx);
+        self.poll_download();
+        if self.download.is_some() { ctx.request_repaint_after(std::time::Duration::from_millis(200)); }
 
         let title = {
             let d = &self.docs[self.cur];
@@ -1131,10 +1654,11 @@ impl App {
         egui::MenuBar::new().ui(ui, |ui| {
             let has_sel = self.docs[self.cur].s.selection.is_some();
             ui.menu_button("File", |ui| {
-                if ui.button("New...                Ctrl+N").clicked() { let (w, h) = new_image_size(ui.ctx()); self.dialog = Some(Dialog::NewImage { w, h }); ui.close(); }
+                if ui.button("New...                Ctrl+N").clicked() { let c = ui.ctx().clone(); self.open_new_dialog(&c); ui.close(); }
                 if ui.button("Open...               Ctrl+O").clicked() { self.open_file_dialog(FileMode::Open); ui.close(); }
                 if ui.button("Save                  Ctrl+S").clicked() { self.save(); ui.close(); }
                 if ui.button("Save As...      Ctrl+Shift+S").clicked() { self.open_file_dialog(FileMode::Save); ui.close(); }
+                if ui.button("Export a Copy...       Ctrl+E").on_hover_text("Save a flat picture (PNG, JPG...) as a separate copy").clicked() { self.open_file_dialog(FileMode::Export); ui.close(); }
                 if ui.button("Close                 Ctrl+W").clicked() { let c = self.cur; self.close_doc(c, false); ui.close(); }
                 ui.separator();
                 ui.horizontal(|ui| { ui.label("JPEG quality"); ui.add(egui::Slider::new(&mut self.jpeg_quality, 1..=100)); });
@@ -1143,15 +1667,20 @@ impl App {
             });
             ui.menu_button("Edit", |ui| {
                 let (cu, cr) = (self.docs[self.cur].can_undo(), self.docs[self.cur].can_redo());
-                if ui.add_enabled(cu, egui::Button::new("Undo                Ctrl+Z")).clicked() { self.doc().undo(); ui.close(); }
-                if ui.add_enabled(cr, egui::Button::new("Redo                Ctrl+Y")).clicked() { self.doc().redo(); ui.close(); }
+                let floating = self.floating_steps();
+                let (cu, cr) = match &floating { Some((n, i)) => (true, i + 1 < n.len()), None => (cu, cr) };
+                if ui.add_enabled(cu, egui::Button::new("Undo                Ctrl+Z")).clicked() { self.undo(); ui.close(); }
+                if ui.add_enabled(cr, egui::Button::new("Redo                Ctrl+Y")).clicked() { self.redo(); ui.close(); }
                 ui.separator();
                 if ui.button("Cut                 Ctrl+X").clicked() { self.cut(); ui.close(); }
                 if ui.button("Copy                Ctrl+C").clicked() { self.copy(false); ui.close(); }
-                if ui.button("Copy Merged").clicked() { self.copy(true); ui.close(); }
+                if ui.button("Copy Merged         Ctrl+Shift+C").clicked() { self.copy(true); ui.close(); }
                 if ui.button("Paste               Ctrl+V").clicked() { self.paste(false); ui.close(); }
-                if ui.button("Paste into New Layer").clicked() { self.paste(true); ui.close(); }
-                if ui.button("Paste into New Image").clicked() { self.paste_new_image(); ui.close(); }
+                if ui.button("Paste into New Layer Ctrl+Shift+V").clicked() { self.paste(true); ui.close(); }
+                if ui.button("Paste into New Image Ctrl+Alt+V").clicked() { self.paste_new_image(); ui.close(); }
+                ui.separator();
+                if ui.add_enabled(has_sel, egui::Button::new("Copy Selection      Ctrl+Shift+Alt+C")).clicked() { self.copy_selection(); ui.close(); }
+                if ui.add_enabled(self.sel_clipboard.is_some(), egui::Button::new("Paste Selection     Ctrl+Shift+Alt+V")).clicked() { self.paste_selection(); ui.close(); }
                 ui.separator();
                 if ui.button("Select All          Ctrl+A").clicked() { self.select_all(); ui.close(); }
                 if ui.add_enabled(has_sel, egui::Button::new("Deselect            Ctrl+D")).clicked() { self.deselect(); ui.close(); }
@@ -1217,11 +1746,59 @@ impl App {
         if ui.add_enabled(a + 1 < n, egui::Button::new("Move Layer Up")).clicked() { self.move_layer(true); ui.close(); }
         if ui.add_enabled(a > 0, egui::Button::new("Move Layer Down")).clicked() { self.move_layer(false); ui.close(); }
         if ui.button("Layer Properties...").clicked() { self.open_layer_props(); ui.close(); }
+        let is_smart = self.docs[self.cur].layer().smart.is_some();
+        if ui.add_enabled(is_smart, egui::Button::new("Rasterize Layer")).on_hover_text("Turn a smart object into ordinary pixels").clicked() { self.rasterize_layer(); ui.close(); }
     }
 
     fn open_layer_props(&mut self) {
         let l = self.docs[self.cur].layer();
         self.dialog = Some(Dialog::LayerProps { name: l.name.clone(), visible: l.visible, opacity: l.opacity, blend: l.blend, orig: (l.name.clone(), l.visible, l.opacity, l.blend) });
+    }
+
+    /// The chosen text font's file and face index (None: the built-in font, e.g. while fonts are scanned).
+    fn text_font(&mut self) -> Option<(Arc<Vec<u8>>, u32)> {
+        let cat = crate::fonts::catalog()?;
+        if self.opts.font_family.is_none() {
+            self.opts.font_family = cat.default_family();
+        }
+        let fam = self.opts.font_family.clone()?;
+        let face = cat.pick(&fam, self.opts.font_weight, self.opts.font_italic)?;
+        cat.data(face.id)
+    }
+
+    /// Font family, weight and italic pickers for the Text tool.
+    fn font_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(cat) = crate::fonts::catalog() else {
+            ui.weak("Loading fonts…");
+            return;
+        };
+        if self.opts.font_family.is_none() {
+            self.opts.font_family = cat.default_family();
+        }
+        let current = self.opts.font_family.clone().unwrap_or_default();
+        ui.label("Font:");
+        egui::ComboBox::from_id_salt("font-family").selected_text(&current).width(170.0).height(320.0).show_ui(ui, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.font_filter).hint_text("Search fonts").desired_width(160.0));
+            let f = self.font_filter.to_lowercase();
+            for (name, _) in cat.families.iter().filter(|(n, _)| f.is_empty() || n.to_lowercase().contains(&f)) {
+                if ui.selectable_label(*name == current, name).clicked() {
+                    self.opts.font_family = Some(name.clone());
+                    ui.close();
+                }
+            }
+        });
+        if let Some(faces) = cat.faces(&current) {
+            let chosen = cat.pick(&current, self.opts.font_weight, self.opts.font_italic);
+            let label = |f: &crate::fonts::Face| format!("{}{}", crate::fonts::weight_name(f.weight), if f.italic { " Italic" } else { "" });
+            egui::ComboBox::from_id_salt("font-weight").selected_text(chosen.map(|c| label(&c)).unwrap_or_default()).show_ui(ui, |ui| {
+                for face in faces {
+                    if ui.selectable_label(Some(*face) == chosen, label(face)).clicked() {
+                        self.opts.font_weight = face.weight;
+                        self.opts.font_italic = face.italic;
+                    }
+                }
+            });
+        }
     }
 
     fn tool_bar(&mut self, ui: &mut egui::Ui) {
@@ -1233,7 +1810,7 @@ impl App {
             let t = self.tool;
             if t.uses_brush_width() {
                 ui.label("Brush width:");
-                ui.add(egui::DragValue::new(&mut self.opts.brush).range(1.0..=2000.0).speed(0.3).max_decimals(0));
+                num_box(ui, &mut self.opts.brush, 1.0..=2000.0, 1.0, "");
             }
             if t.is_shape() {
                 ui.label("Draw:");
@@ -1245,7 +1822,7 @@ impl App {
             }
             if t == Tool::RoundedRect {
                 ui.label("Radius:");
-                ui.add(egui::DragValue::new(&mut self.opts.radius).range(0.0..=500.0).speed(0.3).max_decimals(0));
+                num_box(ui, &mut self.opts.radius, 0.0..=500.0, 1.0, "");
             }
             if matches!(t, Tool::Paintbrush | Tool::Eraser | Tool::CloneStamp | Tool::Recolor | Tool::Line | Tool::Rectangle | Tool::RoundedRect | Tool::Ellipse | Tool::EllipseSelect) {
                 ui.checkbox(&mut self.opts.aa, "Antialiasing");
@@ -1261,6 +1838,14 @@ impl App {
                 ui.label("Tolerance:");
                 let mut pct = (self.opts.tol * 100.0).round();
                 if ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%")).changed() { self.opts.tol = pct / 100.0; }
+                if t != Tool::Recolor {
+                    // the original's "SampleAllLayers" setting (ToolsSection, default off)
+                    ui.label("Sampling:");
+                    egui::ComboBox::from_id_salt("sample").selected_text(if self.opts.sample_image { "Image" } else { "Layer" }).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.opts.sample_image, false, "Layer").on_hover_text("Compare colours on the active layer");
+                        ui.selectable_value(&mut self.opts.sample_image, true, "Image").on_hover_text("Compare colours of the whole picture, all layers together");
+                    });
+                }
             }
             if t.is_select() {
                 ui.label("Selection mode:");
@@ -1275,9 +1860,9 @@ impl App {
                 });
             }
             if t == Tool::Text {
+                self.font_controls(ui);
                 ui.label("Size:");
-                ui.add(egui::DragValue::new(&mut self.opts.font_size).range(4.0..=500.0).speed(0.3).max_decimals(0));
-                ui.checkbox(&mut self.opts.bold, "Bold");
+                num_box(ui, &mut self.opts.font_size, 1.0..=2000.0, 1.0, " pt");
             }
             if t == Tool::CloneStamp {
                 ui.label(match self.clone_anchor { Some(a) => format!("Copying from {}, {}", a.0 as i32, a.1 as i32), None => "Ctrl+click to choose a source".into() });
@@ -1287,12 +1872,12 @@ impl App {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(self.tool.help());
+            if self.status.is_empty() { ui.label(self.tool.help()); } else { ui.spinner(); ui.label(&self.status); }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let hover = self.hover;
                 let d = &mut self.docs[self.cur];
                 let mut pct = d.zoom * 100.0;
-                if ui.add(egui::DragValue::new(&mut pct).range(1.0..=10000.0).suffix("%").speed(1.0).max_decimals(0)).changed() { d.zoom = pct / 100.0; }
+                if num_box(ui, &mut pct, 1.0..=10000.0, 1.0, "%").changed() { d.zoom = pct / 100.0; }
                 ui.separator();
                 ui.label(format!("{} × {}", d.w(), d.h()));
                 ui.separator();
@@ -1390,28 +1975,63 @@ impl App {
     }
 
     fn history_panel(&mut self, ui: &mut egui::Ui) {
+        // a floating picture's own steps (paste, transforms) come after the picture's history
+        let floating = self.floating_steps();
+        let (can_undo, can_redo) = match &floating {
+            Some((n, i)) => (true, i + 1 < n.len()),
+            None => (self.docs[self.cur].can_undo(), self.docs[self.cur].can_redo()),
+        };
+        let mut action = 0;
         ui.horizontal(|ui| {
             ui.strong("History");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let d = &mut self.docs[self.cur];
-                if ui.add_enabled(d.can_redo(), egui::Button::new("⏭").small()).on_hover_text("Redo all").clicked() { let n = d.history.len() - 1; d.goto(n); }
-                if ui.add_enabled(d.can_redo(), egui::Button::new("↷").small()).on_hover_text("Redo (Ctrl+Y)").clicked() { d.redo(); }
-                if ui.add_enabled(d.can_undo(), egui::Button::new("↶").small()).on_hover_text("Undo (Ctrl+Z)").clicked() { d.undo(); }
-                if ui.add_enabled(d.can_undo(), egui::Button::new("⏮").small()).on_hover_text("Undo all").clicked() { d.goto(0); }
+                if ui.add_enabled(can_redo, egui::Button::new("⏭").small()).on_hover_text("Redo all").clicked() { action = 4; }
+                if ui.add_enabled(can_redo, egui::Button::new("↷").small()).on_hover_text("Redo (Ctrl+Y)").clicked() { action = 3; }
+                if ui.add_enabled(can_undo, egui::Button::new("↶").small()).on_hover_text("Undo (Ctrl+Z)").clicked() { action = 2; }
+                if ui.add_enabled(can_undo, egui::Button::new("⏮").small()).on_hover_text("Undo all").clicked() { action = 1; }
             });
         });
+        let mut jump = None;
+        let mut float_jump = None;
         egui::ScrollArea::vertical().id_salt("hist").max_height(180.0).stick_to_bottom(true).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             let muted = self.theme().muted;
-            let d = &mut self.docs[self.cur];
-            let mut jump = None;
+            let icon_col = self.theme().icon;
+            // one row: the step's icon, then its name
+            let row = |ui: &mut egui::Ui, name: &str, selected: bool, text: egui::RichText, future: bool| -> egui::Response {
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                    tools::history_icon(ui.painter(), r, name, if future { muted } else { icon_col });
+                    ui.selectable_label(selected, text)
+                }).inner
+            };
+            let d = &self.docs[self.cur];
             for (i, item) in d.history.iter().enumerate() {
                 let future = i > d.hist_pos;
                 let text = if future { egui::RichText::new(&item.name).color(muted) } else { egui::RichText::new(&item.name) };
-                if ui.selectable_label(i == d.hist_pos, text).clicked() { jump = Some(i); }
+                if row(ui, &item.name, i == d.hist_pos && floating.is_none(), text, future).clicked() { jump = Some(i); }
             }
-            if let Some(i) = jump { d.goto(i); }
+            if let Some((names, cur)) = &floating {
+                for (i, name) in names.iter().enumerate() {
+                    let future = i > *cur;
+                    let text = if future { egui::RichText::new(name).color(muted) } else { egui::RichText::new(name).italics() };
+                    if row(ui, name, i == *cur, text, future).on_hover_text("Still floating: deselect or press Enter to put it down").clicked() { float_jump = Some(i); }
+                }
+            }
         });
+        match action {
+            1 => { if floating.is_some() { self.floating_goto(0); self.undo(); } self.finish_floating(); self.doc().goto(0); }
+            2 => self.undo(),
+            3 => self.redo(),
+            4 => { if let Some((n, _)) = &floating { self.floating_goto(n.len() - 1); } else { let d = self.doc(); let n = d.history.len() - 1; d.goto(n); } }
+            _ => {}
+        }
+        if let Some(i) = float_jump { self.floating_goto(i); }
+        if let Some(i) = jump {
+            // jumping back past a floating picture takes it away first
+            self.cancel_floating();
+            self.doc().goto(i);
+        }
     }
 
     fn layers_panel(&mut self, ui: &mut egui::Ui) {
@@ -1449,7 +2069,11 @@ impl App {
                     ui.painter().image(t.id(), tr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                     ui.painter().rect_stroke(tr, 0.0, Stroke::new(1.0, th.border), egui::StrokeKind::Outside);
                 }
-                ui.painter().text(pos2(r.left() + 52.0, r.center().y), egui::Align2::LEFT_CENTER, &l.name, egui::FontId::proportional(13.0), th.text);
+                let name_rect = ui.painter().text(pos2(r.left() + 52.0, r.center().y), egui::Align2::LEFT_CENTER, &l.name, egui::FontId::proportional(13.0), th.text);
+                if l.smart.is_some() {
+                    // a small mark for smart objects
+                    ui.painter().text(pos2(name_rect.right() + 6.0, r.center().y), egui::Align2::LEFT_CENTER, "◆ smart", egui::FontId::proportional(10.0), th.accent);
+                }
                 let cb = Rect::from_center_size(pos2(r.right() - 14.0, r.center().y), vec2(16.0, 16.0));
                 let cresp = ui.interact(cb, ui.scope_id().with(("vis", i)), Sense::click());
                 ui.painter().rect_filled(cb, 2.0, Color32::WHITE);
@@ -1461,9 +2085,9 @@ impl App {
             }
         });
         match action {
-            Some((i, 0)) => { let d = self.doc(); d.s.layers[i].visible = !d.s.layers[i].visible; d.commit("Layer Visibility"); }
-            Some((i, 1)) => { self.doc().s.active = i; self.open_layer_props(); }
-            Some((i, _)) => { let d = self.doc(); d.s.active = i; d.touch(); }
+            Some((i, 0)) => { self.finish_floating(); let d = self.doc(); d.s.layers[i].visible = !d.s.layers[i].visible; d.commit("Layer Visibility"); }
+            Some((i, 1)) => { self.finish_floating(); self.doc().s.active = i; self.open_layer_props(); }
+            Some((i, _)) => { self.finish_floating(); let d = self.doc(); d.s.active = i; d.touch(); }
             None => {}
         }
         ui.horizontal(|ui| {
@@ -1492,7 +2116,7 @@ impl App {
                     if ui.small_button("×").on_hover_text("Close").clicked() { close = Some(i); }
                     ui.add_space(6.0);
                 }
-                if let Some(i) = pick { self.finish_text(); self.cur = i; self.drag = None; }
+                if let Some(i) = pick { self.finish_text(); self.finish_floating(); self.cur = i; self.drag = None; }
                 if let Some(i) = close { self.close_doc(i, false); }
             });
         });
@@ -1556,6 +2180,14 @@ impl App {
         let img_rect = Rect::from_center_size(center, size);
         let to_img = |p: Pos2| ((p.x - img_rect.min.x) / z, (p.y - img_rect.min.y) / z);
         let to_scr = |x: f32, y: f32| pos2(img_rect.min.x + x * z, img_rect.min.y + y * z);
+        // the part of the picture on screen, for placing pastes like the original
+        {
+            let vis = img_rect.intersect(avail);
+            self.visible_img = (vis.width() > 0.0 && vis.height() > 0.0).then(|| {
+                let (a, b) = (to_img(vis.min), to_img(vis.max));
+                (a.0.ceil().max(0.0) as usize, a.1.ceil().max(0.0) as usize, (b.0.floor().max(0.0) as usize).min(w), (b.1.floor().max(0.0) as usize).min(h))
+            });
+        }
 
         let painter = ui.painter_at(avail);
         painter.rect_filled(img_rect.translate(vec2(3.0, 3.0)).expand(1.0), 0.0, Color32::from_black_alpha(50));
@@ -1655,16 +2287,37 @@ impl App {
             }
         }
 
-        // wheel: scroll pans, ctrl+wheel / pinch zooms
+        // Mouse wheel, as the original's CanvasControl.ProcessVerticalPointerWheel (paintdotnet.dll 0x06002299):
+        // no key = scroll up/down, Shift = scroll sideways (120 screen pixels per notch), Ctrl = zoom by
+        // 1.12 per notch around the pointer, snapping to a whole-number zoom when within 5 %.
         if resp.hovered() {
-            let (scroll, zoom_delta) = ctx.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
-            if zoom_delta != 1.0 {
-                let around = hover_pos.map(to_img);
-                self.zoom_step(if zoom_delta > 1.0 { 1 } else { -1 }, around);
-            } else if scroll != Vec2::ZERO {
-                let d = self.doc();
-                d.pan.0 += scroll.x;
-                d.pan.1 += scroll.y;
+            let (wheels, zoom_delta) = ctx.input(|i| {
+                let w: Vec<(Vec2, bool, egui::Modifiers)> = i.events.iter().filter_map(|e| match e {
+                    egui::Event::MouseWheel { unit, delta, modifiers, .. } => Some(match unit {
+                        egui::MouseWheelUnit::Point => (*delta / WHEEL_PIXELS_PER_NOTCH, true, *modifiers),
+                        egui::MouseWheelUnit::Line => (*delta, false, *modifiers),
+                        egui::MouseWheelUnit::Page => (*delta * 3.0, false, *modifiers),
+                    }),
+                    _ => None,
+                }).collect();
+                (w, i.zoom_delta())
+            });
+            let around = hover_pos.map(to_img);
+            for (notches, _fine, m) in &wheels {
+                let n = if notches.y != 0.0 { notches.y } else { notches.x };
+                if m.ctrl || m.command {
+                    if n != 0.0 { self.wheel_zoom(n, around); }
+                } else if m.shift {
+                    self.doc().pan.0 += n * WHEEL_SCROLL_PIXELS;
+                } else if !m.alt {
+                    let d = self.doc();
+                    d.pan.0 += notches.x * WHEEL_SCROLL_PIXELS;
+                    d.pan.1 += notches.y * WHEEL_SCROLL_PIXELS;
+                }
+            }
+            // touchpad pinch (no wheel events): same smooth zoom
+            if wheels.is_empty() && zoom_delta != 1.0 {
+                self.zoom_to(self.docs[self.cur].zoom * zoom_delta, around);
             }
         }
 
@@ -1678,6 +2331,24 @@ impl App {
 
         let pressed_p = pointer.button_pressed(egui::PointerButton::Primary);
         let pressed_s = pointer.button_pressed(egui::PointerButton::Secondary);
+        // free transform (Move Selected Pixels tool): handles move, resize and rotate
+        let scr = |x: f32, y: f32| { let s = to_scr(x, y); (s.x, s.y) };
+        if self.tool == Tool::MovePixels {
+            if (pressed_p || pressed_s) && resp.hovered() && self.xdrag.is_none() && self.dialog.is_none() {
+                if let Some(p) = hover_pos {
+                    self.xform_press((p.x, p.y), to_img(p), pressed_s, &scr);
+                }
+            } else if self.xdrag.is_some() {
+                if let Some(p) = pointer.latest_pos() { self.xform_update(to_img(p), mods.shift); }
+                if !(pointer.primary_down() || pointer.secondary_down()) { self.xform_release(); }
+                ctx.request_repaint();
+            }
+            self.draw_xform_box(&painter, &scr);
+            if resp.hovered() {
+                if let Some(p) = hover_pos { ctx.set_cursor_icon(self.xform_cursor((p.x, p.y), &scr)); }
+            }
+            return;
+        }
         if (pressed_p || pressed_s) && resp.hovered() && self.drag.is_none() && self.dialog.is_none() {
             if let Some(p) = hover_pos {
                 if self.tool == Tool::Pan {
@@ -1720,15 +2391,18 @@ impl App {
         let mut finish = false;
         let mut cancel = false;
         let before = t.text.clone();
-        let font_before = (self.opts.font_size, self.opts.bold, t.color);
+        let font_key = |o: &Opts| (o.font_size, o.font_family.clone(), o.font_weight, o.font_italic);
+        let font_before = (font_key(&self.opts), t.color);
         egui::Window::new("Text").collapsible(false).resizable(false).default_pos(pos2(420.0, 140.0)).show(ctx, |ui| {
             ui.label("Type your text. It is drawn in the primary colour.");
             let r = ui.add(egui::TextEdit::multiline(&mut t.text).desired_rows(3).desired_width(260.0));
             if before.is_empty() && !r.has_focus() { r.request_focus(); }
             ui.horizontal(|ui| {
+                self.font_controls(ui);
+            });
+            ui.horizontal(|ui| {
                 ui.label("Size:");
-                ui.add(egui::DragValue::new(&mut self.opts.font_size).range(4.0..=500.0).max_decimals(0));
-                ui.checkbox(&mut self.opts.bold, "Bold");
+                num_box(ui, &mut self.opts.font_size, 1.0..=2000.0, 1.0, " pt");
             });
             ui.horizontal(|ui| {
                 if ui.button("Finish").clicked() { finish = true; }
@@ -1742,7 +2416,7 @@ impl App {
             d.mark_full();
             return;
         }
-        if t.text != before || font_before != (self.opts.font_size, self.opts.bold, t.color) { self.render_text_preview(&mut t); }
+        if t.text != before || font_before != (font_key(&self.opts), t.color) { self.render_text_preview(&mut t); }
         self.text = Some(t);
         if finish { self.finish_text(); }
     }
@@ -1763,11 +2437,88 @@ impl App {
                     if ui.button("OK").clicked() { keep = false; }
                 });
             }
+            Dialog::PasteBig { pic, new_layer } => {
+                let (pw, ph, nl) = (pic.w, pic.h, *new_layer);
+                let (cw, ch) = (self.docs[self.cur].w(), self.docs[self.cur].h());
+                let mut choice = 0;
+                win("Paste a bigger picture").show(ctx, |ui| {
+                    ui.label(format!("The picture you're pasting is {pw} × {ph}, bigger than the canvas ({cw} × {ch})."));
+                    ui.horizontal(|ui| {
+                        if ui.button("Expand canvas").clicked() { choice = 1; }
+                        if ui.button("Keep canvas size").clicked() { choice = 2; }
+                        if ui.button("Cancel").clicked() { choice = 3; }
+                    });
+                });
+                if choice != 0 {
+                    keep = false;
+                    if choice < 3 {
+                        let Dialog::PasteBig { pic, .. } = std::mem::replace(&mut dlg, Dialog::About) else { unreachable!() };
+                        self.paste_into(pic, nl, choice == 1);
+                    }
+                }
+            }
+            Dialog::Rasterize => {
+                let mut choice = 0;
+                win("Smart object").show(ctx, |ui| {
+                    ui.label("This layer is a smart object: it keeps its whole picture, even the parts outside the canvas.");
+                    ui.label("To paint or apply effects on it, it has to become ordinary pixels first. Parts outside the canvas will then be cut off.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Rasterize layer").clicked() { choice = 1; }
+                        if ui.button("Cancel").clicked() { choice = 2; }
+                    });
+                });
+                if choice != 0 {
+                    keep = false;
+                    if choice == 1 { self.rasterize_layer(); }
+                }
+            }
+            Dialog::DropChoice { items } => {
+                let n = items.len();
+                let mut choice = 0;
+                win(if n == 1 { "Open or add as a layer?" } else { "Open or add as layers?" }).show(ctx, |ui| {
+                    ui.label(if n == 1 { "What do you want to do with the picture you dropped?".to_string() } else { format!("What do you want to do with the {n} pictures you dropped?") });
+                    ui.horizontal(|ui| {
+                        if ui.button(if n == 1 { "Open" } else { "Open each" }).on_hover_text("Open in its own tab").clicked() { choice = 1; }
+                        if ui.button(if n == 1 { "Add layer" } else { "Add layers" }).on_hover_text("Add to the current picture as new layers").clicked() { choice = 2; }
+                        if ui.button("Cancel").clicked() { choice = 3; }
+                    });
+                });
+                if choice != 0 {
+                    keep = false;
+                    if choice < 3 {
+                        let items = std::mem::take(items);
+                        self.handle_drop(items, choice == 2);
+                    }
+                }
+            }
+            Dialog::Overwrite { path, export } => {
+                let (p, export) = (path.clone(), *export);
+                let is_original = export && self.docs[self.cur].source.as_ref() == Some(&p);
+                let mut choice = 0;
+                win("Replace file?").show(ctx, |ui| {
+                    if is_original {
+                        ui.label(format!("\"{}\" is the original picture you opened. Replace it with this version?", io::file_name(&p)));
+                    } else {
+                        ui.label(format!("\"{}\" already exists. Replace it?", io::file_name(&p)));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Replace").clicked() { choice = 1; }
+                        if ui.button("Cancel").clicked() { choice = 2; }
+                    });
+                });
+                if choice != 0 {
+                    keep = false;
+                    if choice == 1 {
+                        let r = if export { self.export_copy(p) } else { self.save_project(p) };
+                        if let Err(e) = r { self.dialog = Some(Dialog::Message(format!("Couldn't save: {e}"))); }
+                    }
+                }
+            }
             Dialog::NewImage { w, h } => {
                 win("New Image").show(ctx, |ui| {
                     egui::Grid::new("ng").show(ui, |ui| {
-                        ui.label("Width:"); ui.add(egui::DragValue::new(w).range(1..=20000).suffix(" px")); ui.end_row();
-                        ui.label("Height:"); ui.add(egui::DragValue::new(h).range(1..=20000).suffix(" px")); ui.end_row();
+                        ui.label("Width:"); num_box(ui, w, 1..=20000, 1.0, " px"); ui.end_row();
+                        ui.label("Height:"); num_box(ui, h, 1..=20000, 1.0, " px"); ui.end_row();
                     });
                     ui.label("The background uses the secondary colour.");
                     ui.horizontal(|ui| {
@@ -1788,8 +2539,8 @@ impl App {
                 let mut ok = false;
                 win("Resize Image").show(ctx, |ui| {
                     egui::Grid::new("rg").show(ui, |ui| {
-                        ui.label("Width:"); if ui.add(egui::DragValue::new(w).range(1..=20000).suffix(" px")).changed() && *k { *h = ((*w as f32) * oh / ow).round().max(1.0) as u32; } ui.end_row();
-                        ui.label("Height:"); if ui.add(egui::DragValue::new(h).range(1..=20000).suffix(" px")).changed() && *k { *w = ((*h as f32) * ow / oh).round().max(1.0) as u32; } ui.end_row();
+                        ui.label("Width:"); if num_box(ui, w, 1..=20000, 1.0, " px").changed() && *k { *h = ((*w as f32) * oh / ow).round().max(1.0) as u32; } ui.end_row();
+                        ui.label("Height:"); if num_box(ui, h, 1..=20000, 1.0, " px").changed() && *k { *w = ((*h as f32) * ow / oh).round().max(1.0) as u32; } ui.end_row();
                     });
                     ui.checkbox(k, "Keep aspect ratio");
                     ui.horizontal(|ui| {
@@ -1804,7 +2555,16 @@ impl App {
                     let (nw, nh) = (*w as usize, *h as usize);
                     let d = self.doc();
                     let (w0, h0) = (d.w(), d.h());
-                    for l in d.s.layers.iter_mut() { l.px = raster::resize(&l.px, w0, h0, nw, nh); }
+                    let (fx, fy) = (nw as f32 / w0 as f32, nh as f32 / h0 as f32);
+                    for l in d.s.layers.iter_mut() {
+                        if let Some(s) = l.smart.as_mut() {
+                            // smart objects are resized by their placement, from their full original
+                            s.xf.cx *= fx; s.xf.cy *= fy; s.xf.sx *= fx; s.xf.sy *= fy;
+                            l.rerender(nw, nh);
+                        } else {
+                            l.px = raster::resize(&l.px, w0, h0, nw, nh);
+                        }
+                    }
                     d.s.w = nw; d.s.h = nh; d.s.selection = None;
                     d.commit("Resize Image");
                     self.zoom_fit();
@@ -1814,8 +2574,8 @@ impl App {
                 let mut ok = false;
                 win("Canvas Size").show(ctx, |ui| {
                     egui::Grid::new("cg").show(ui, |ui| {
-                        ui.label("Width:"); ui.add(egui::DragValue::new(w).range(1..=20000).suffix(" px")); ui.end_row();
-                        ui.label("Height:"); ui.add(egui::DragValue::new(h).range(1..=20000).suffix(" px")); ui.end_row();
+                        ui.label("Width:"); num_box(ui, w, 1..=20000, 1.0, " px"); ui.end_row();
+                        ui.label("Height:"); num_box(ui, h, 1..=20000, 1.0, " px"); ui.end_row();
                     });
                     ui.label("Anchor:");
                     egui::Grid::new("anchor").spacing(vec2(2.0, 2.0)).show(ui, |ui| {
@@ -1835,6 +2595,12 @@ impl App {
                     let ox = (nw as i32 - w0 as i32) * an.0 / 2;
                     let oy = (nh as i32 - h0 as i32) * an.1 / 2;
                     for (i, l) in d.s.layers.iter_mut().enumerate() {
+                        if let Some(s) = l.smart.as_mut() {
+                            // the canvas moves over the smart object; hidden parts come back if it grows
+                            s.xf.cx += ox as f32; s.xf.cy += oy as f32;
+                            l.rerender(nw, nh);
+                            continue;
+                        }
                         let fill = if i == 0 && l.name == "Background" { bg } else { [0, 0, 0, 0] };
                         l.px = raster::recanvas(&l.px, w0, h0, nw, nh, ox, oy, fill);
                     }
@@ -1955,8 +2721,9 @@ impl App {
         let mut refresh = false;
         let mut accept: Option<PathBuf> = None;
         let Dialog::File { mode, dir, name, ext, err, entries } = dlg else { return false };
-        let title = match mode { FileMode::Open => "Open", FileMode::Save => "Save As", FileMode::ImportLayer => "Import From File" };
-        let is_save = matches!(mode, FileMode::Save);
+        let title = match mode { FileMode::Open => "Open", FileMode::Save => "Save Project (.pxe)", FileMode::Export => "Export a Copy", FileMode::ImportLayer => "Import From File" };
+        let is_save = matches!(mode, FileMode::Save | FileMode::Export);
+        let is_export = matches!(mode, FileMode::Export);
         egui::Window::new(title).collapsible(false).resizable(true).default_size(vec2(520.0, 420.0)).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).order(egui::Order::Foreground).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("⬆ Up").clicked() { if let Some(p) = dir.parent() { *dir = p.to_path_buf(); refresh = true; } }
@@ -1981,15 +2748,17 @@ impl App {
                 ui.label("File name:");
                 let r = ui.add(egui::TextEdit::singleline(name).desired_width(240.0));
                 if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !name.is_empty() { accept = Some(dir.join(name.as_str())); }
-                if is_save {
-                    egui::ComboBox::from_id_salt("ext").selected_text(io::SAVE_EXTS[*ext].to_uppercase()).show_ui(ui, |ui| {
-                        for (i, e) in io::SAVE_EXTS.iter().enumerate() {
-                            let label = if *e == "pxe" { "PXE (keeps layers)".to_string() } else { e.to_uppercase() };
-                            ui.selectable_value(ext, i, label);
+                if is_export {
+                    egui::ComboBox::from_id_salt("ext").selected_text(io::EXPORT_EXTS[*ext].to_uppercase()).show_ui(ui, |ui| {
+                        for (i, e) in io::EXPORT_EXTS.iter().enumerate() {
+                            ui.selectable_value(ext, i, e.to_uppercase());
                         }
                     });
+                } else if is_save {
+                    ui.label(".pxe (keeps layers)");
                 }
             });
+            if is_export { ui.label("Writes a separate flat picture. Your project and the original stay as they are."); }
             if !err.is_empty() { ui.colored_label(Color32::from_rgb(190, 30, 30), err.as_str()); }
             ui.horizontal(|ui| {
                 if ui.button(if is_save { "Save" } else { "Open" }).clicked() && !name.is_empty() { accept = Some(dir.join(name.as_str())); }
@@ -1998,11 +2767,20 @@ impl App {
         });
         if let Some(mut p) = accept {
             match mode {
-                FileMode::Save => {
-                    let want = io::SAVE_EXTS[*ext];
+                FileMode::Save | FileMode::Export => {
+                    let export = matches!(mode, FileMode::Export);
+                    let want = if export { io::EXPORT_EXTS[*ext] } else { "pxe" };
                     let has = p.extension().map(|e| e.to_string_lossy().to_lowercase());
                     if has.as_deref() != Some(want) && !(want == "jpg" && has.as_deref() == Some("jpeg")) { let mut s = p.into_os_string(); s.push(format!(".{want}")); p = PathBuf::from(s); }
-                    match self.do_save(p) { Ok(()) => keep = false, Err(e) => *err = format!("Couldn't save: {e}") }
+                    let own_project = !export && self.docs[self.cur].path.as_ref() == Some(&p);
+                    if p.exists() && !own_project {
+                        // never replace an existing file without asking
+                        keep = false;
+                        self.dialog = Some(Dialog::Overwrite { path: p, export });
+                    } else {
+                        let r = if export { self.export_copy(p) } else { self.save_project(p) };
+                        match r { Ok(()) => keep = false, Err(e) => *err = format!("Couldn't save: {e}") }
+                    }
                 }
                 FileMode::Open => {
                     if p.is_dir() { *dir = p; refresh = true; } else { keep = false; self.open_path(p); }

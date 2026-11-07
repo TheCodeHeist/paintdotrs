@@ -371,11 +371,18 @@ pub fn lerp_px(a: Px, b: Px, t: f32) -> Px {
     o
 }
 
-/// Text rendered as a coverage mask at (x, y) top-left; returns (coverage, width, height).
-pub fn text_coverage(w: usize, h: usize, text: &str, size: f32, x: f32, y: f32, bold: bool) -> Coverage {
-    use ab_glyph::{Font, FontRef, ScaleFont};
+/// Text rendered as a coverage mask at (x, y) top-left, in the given font file (bytes, face index), or the
+/// built-in font when there's none. `size` is in pixels.
+pub fn text_coverage(w: usize, h: usize, text: &str, size: f32, x: f32, y: f32, font: Option<(&[u8], u32)>) -> Coverage {
+    use ab_glyph::FontRef;
+    let chosen = font.and_then(|(data, index)| FontRef::try_from_slice_and_index(data, index).ok());
+    let font = chosen.unwrap_or_else(|| FontRef::try_from_slice(epaint_default_fonts::UBUNTU_LIGHT).expect("font"));
+    draw_text(&font, w, h, text, size, x, y)
+}
+
+fn draw_text(font: &ab_glyph::FontRef, w: usize, h: usize, text: &str, size: f32, x: f32, y: f32) -> Coverage {
+    use ab_glyph::{Font, ScaleFont};
     let mut cov = Coverage::new(w, h);
-    let font = FontRef::try_from_slice(epaint_default_fonts::UBUNTU_LIGHT).expect("font");
     let sf = font.as_scaled(size.max(1.0));
     let mut caret_y = y + sf.ascent();
     for line in text.split('\n') {
@@ -391,15 +398,12 @@ pub fn text_coverage(w: usize, h: usize, text: &str, size: f32, x: f32, y: f32, 
             prev = Some(gid);
             if let Some(og) = font.outline_glyph(g) {
                 let bb = og.px_bounds();
-                let offs: &[(i32, i32)] = if bold { &[(0, 0), (1, 0)] } else { &[(0, 0)] };
-                for &(ox, oy) in offs {
-                    og.draw(|gx, gy, v| {
-                        let px = bb.min.x as i32 + gx as i32 + ox;
-                        let py = bb.min.y as i32 + gy as i32 + oy;
-                        cov.grow(px, py, px, py);
-                        cov.put(px, py, (v.clamp(0.0, 1.0) * 255.0) as u8);
-                    });
-                }
+                og.draw(|gx, gy, v| {
+                    let px = bb.min.x as i32 + gx as i32;
+                    let py = bb.min.y as i32 + gy as i32;
+                    cov.grow(px, py, px, py);
+                    cov.put(px, py, (v.clamp(0.0, 1.0) * 255.0) as u8);
+                });
             }
         }
         caret_y += sf.height() + sf.line_gap();

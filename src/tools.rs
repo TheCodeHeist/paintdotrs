@@ -81,7 +81,7 @@ impl Tool {
 
     pub fn help(self) -> &'static str {
         match self {
-            Tool::MovePixels => "Drag to move the selected pixels. With nothing selected, the whole layer moves.",
+            Tool::MovePixels => "Free transform: drag to move, drag the square handles to resize (Shift keeps proportions), drag the round handle or right-drag to rotate. Enter or Deselect puts floating pixels down.",
             Tool::MoveSelection => "Drag to move the selection outline without touching any pixels.",
             Tool::RectSelect => "Drag to select a rectangle. Hold Shift for a square. A plain click deselects.",
             Tool::LassoSelect => "Drag to draw around the area you want to select.",
@@ -109,6 +109,55 @@ impl Tool {
     pub fn is_select(self) -> bool { matches!(self, Tool::RectSelect | Tool::LassoSelect | Tool::EllipseSelect | Tool::MagicWand) }
     pub fn uses_brush_width(self) -> bool {
         matches!(self, Tool::Paintbrush | Tool::Eraser | Tool::CloneStamp | Tool::Recolor | Tool::Line | Tool::Rectangle | Tool::RoundedRect | Tool::Ellipse)
+    }
+}
+
+/// Draw a small icon for a History step, so steps can be told apart at a glance: the tool that made it,
+/// or a symbol for its kind (selection, layers, the whole picture, adjustments and effects, files).
+pub fn history_icon(p: &Painter, r: Rect, name: &str, col: Color32) {
+    // steps named after a tool get that tool's icon
+    if let Some(t) = Tool::ALL.iter().find(|t| t.name() == name) {
+        return icon(p, r, *t, col);
+    }
+    let by_tool = match name {
+        "Select All" | "Deselect" | "Invert Selection" | "Paste Selection" => Some(Tool::RectSelect),
+        "Paste" | "Paste into New Layer" | "Import From File" | "Free Transform" => Some(Tool::MovePixels),
+        "Erase Selection" | "Cut" => Some(Tool::Eraser),
+        "Fill Selection" => Some(Tool::PaintBucket),
+        _ => None,
+    };
+    if let Some(t) = by_tool {
+        return icon(p, r, t, col);
+    }
+    let c = r.center();
+    let s = r.width().min(r.height()) / 24.0;
+    let pt = |x: f32, y: f32| pos2(c.x + (x - 12.0) * s, c.y + (y - 12.0) * s);
+    let st = Stroke::new(1.5 * s, col);
+    let layer_words = ["Layer", "Flatten", "Merge"];
+    let image_words = ["Resize", "Canvas", "Crop", "Flip", "Rotate", "Expand"];
+    if layer_words.iter().any(|w| name.contains(w)) {
+        // stacked sheets
+        for (i, y) in [6.0, 11.0, 16.0].iter().enumerate() {
+            let pts = vec![pt(12.0, y - 3.0), pt(20.0, *y), pt(12.0, y + 3.0), pt(4.0, *y)];
+            let fill = if i == 0 { col.gamma_multiply(0.35) } else { Color32::TRANSPARENT };
+            p.add(egui::Shape::convex_polygon(pts, fill, st));
+        }
+    } else if image_words.iter().any(|w| name.contains(w)) {
+        // a picture frame with corner marks
+        p.rect_stroke(Rect::from_min_max(pt(5.0, 5.0), pt(19.0, 19.0)), 1.0, st, egui::StrokeKind::Middle);
+        p.add(egui::Shape::convex_polygon(vec![pt(6.0, 18.0), pt(11.0, 11.0), pt(15.0, 15.0), pt(18.0, 12.0), pt(18.0, 18.0)], col.gamma_multiply(0.6), Stroke::NONE));
+    } else if name.contains("Open") || name.contains("New Image") {
+        // a document
+        p.add(egui::Shape::convex_polygon(vec![pt(6.0, 3.0), pt(15.0, 3.0), pt(19.0, 7.0), pt(19.0, 21.0), pt(6.0, 21.0)], Color32::TRANSPARENT, st));
+        p.line_segment([pt(15.0, 3.0), pt(15.0, 7.0)], st);
+        p.line_segment([pt(15.0, 7.0), pt(19.0, 7.0)], st);
+    } else {
+        // adjustments and effects: a sparkle
+        p.line_segment([pt(12.0, 3.0), pt(12.0, 21.0)], st);
+        p.line_segment([pt(3.0, 12.0), pt(21.0, 12.0)], st);
+        p.line_segment([pt(6.0, 6.0), pt(18.0, 18.0)], Stroke::new(1.0 * s, col));
+        p.line_segment([pt(18.0, 6.0), pt(6.0, 18.0)], Stroke::new(1.0 * s, col));
+        p.circle_filled(c, 2.5 * s, col);
     }
 }
 

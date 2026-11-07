@@ -125,6 +125,70 @@ Rectangle, Rounded Rectangle, Ellipse.
   set, other effects' formulas (blurs, distortions, noise, sharpen, vignette,
   clouds, emboss, edge detect, auto-level).
 
+## Mouse wheel: exact
+- Canvas, `CanvasControl.ProcessVerticalPointerWheel` (paintdotnet.dll 0x06002299): no key = scroll up/down,
+  Shift = scroll sideways, by delta / zoom canvas pixels (one notch = 120 → 120 screen pixels); Ctrl = zoom
+  around the pointer by 1.12^(|delta|/120) (in for wheel up, out for down), clamped to the zoom range, then
+  snapped to round(zoom) when |round − new| < 5 % of round and closer than the old zoom. Other keys: nothing.
+- Number boxes, `PdnNumericSpin.OnMouseWheel` (PaintDotNet.Framework.dll 0x0600077f): wheel delta is
+  accumulated; each notch presses Up/Down "lines per notch" times (system setting, 3 by default); ignored
+  while Shift or Alt is held.
+- Touchpads report pixels, not notches: 50 pixels count as one notch (**estimated**).
+
+## Paste: exact
+`PasteImageAction.PerformActionImpl` (paintdotnet.dll 0x060028f4), `ShowExpandCanvasTaskDialog` (0x060028f7):
+- No picture on the clipboard → "The clipboard doesn't contain an image." (string table `PasteAction.Error.NoImage`).
+- Picture wider or taller than the canvas → ask: Expand canvas (new size = max of both, per side) / Keep
+  canvas size / Cancel (`ExpandCanvasQuestion.*`).
+- Placement: at the canvas's top-left if it fits inside the visible part there; otherwise moved to start at
+  the visible part's left/top edge, or to end at its right/bottom edge if it would stick out; never left of or
+  above the canvas. The pasted pixels become the selection and the Move Selected Pixels tool is chosen.
+
+## Drag and drop
+- Original, `MainForm.OnDragDropImpl` (paintdotnet.dll 0x06001146) and `OnDragEnter` (0x06001143): only files
+  (folders are skipped). One file with no picture open opens directly; otherwise it asks "Open" (each as its
+  own picture) / "Add layers" (to the current picture) / Cancel (`DragDrop.OpenOrImport.*` strings).
+- The rebuild does the same: folders skipped; one picture with nothing open opens directly; otherwise it asks
+  Open / Add layers / Cancel. Additions: pictures dragged from web browsers (http/https/data: addresses, or
+  raw picture data), and Shift+drop adds them as layers without asking.
+- Edit menu keys, from `EditMenu..ctor` (paintdotnet.dll 0x06000abc), in menu order: Undo Ctrl+Z, Redo Ctrl+Y,
+  Cut Ctrl+X, Copy Ctrl+C, Copy Merged Ctrl+Shift+C, Paste Ctrl+V, Paste into New Layer Ctrl+Shift+V, Paste into
+  New Image Ctrl+Alt+V, Copy Selection Ctrl+Shift+Alt+C, Paste Selection Ctrl+Shift+Alt+V, Erase Selection Delete,
+  Invert Selection Ctrl+I, Select All Ctrl+A, Deselect Ctrl+D. All used as-is. Copy/Paste Selection copy and
+  re-apply only the selection outline (kept inside the app).
+
+## Free transform and smart objects (the person's design)
+- Original: `MoveTool.HelpText` (string table) — "Drag the selection to move. Drag the handles to resize. Drag
+  with right mouse button to rotate."; `MoveSelectionTool.HelpText` — Shift constrains while resizing or
+  rotating. The rebuild follows that: handles resize, right-drag (or the round handle) rotates, Shift keeps
+  proportions on corners and snaps rotation to 15° (same step as the line/gradient snap, 0x06001fd4).
+- Selected pixels float until deselected (Enter, Deselect, another tool or edit); Escape/Undo restore them.
+- Pasted, dropped and imported pictures arrive floating with handles (the person's request).
+- The canvas is only a mask (the person's request): when floating pixels are put down and part of them lies
+  outside the canvas, they become a smart object layer that keeps the whole source picture and its placement
+  (centre, scale, rotation); Canvas Size, Crop, Resize, Flip and Rotate move the canvas over it without
+  cutting anything. Smart objects are stored only in `.pxe` (format version PXEASEL2); exports are flattened.
+- Resampling, from the original: `MoveToolContentRenderer.GetEffectiveInterpolationMode` (paintdotnet.dll
+  0x06001ed1) uses nearest-neighbour (an exact copy) for whole-pixel moves and the chosen mode otherwise; the
+  default mode is `ToolsSection` "MoveToolInterpolationMode" = 5 (0x06002adf) = High Quality Cubic (enum
+  NearestNeighbor, Linear, MultisampleLinear, Anisotropic, HighQualityCubic, numbered from 1 — derived from
+  5 being the default). The rebuild: exact copy for whole-pixel moves; Catmull-Rom cubic in premultiplied
+  alpha (clamped against ringing) when enlarging or rotating; an averaged grid of samples when shrinking
+  (**estimated** stand-in for the original's cubic minification).
+
+## Text tool font
+- `TextSection` .ctor (paintdotnet.dll 0x06003575): FontFamilyName default "Calibri", FontSize 12. The rebuild
+  lists every system font (searchable) with its weights and italics; default Calibri when installed, else
+  Carlito (same letter widths), Ubuntu, Noto Sans, Cantarell, DejaVu Sans, Liberation Sans (**estimated** order).
+  Size unit: `TextSection` "FontSizeMetric" default 0 = Points (enum Points, Fixed96Dpi); `TextTool.
+  GetSizedFontProperties` (paintdotnet.dll 0x06001cf4) sizes the font from the picture's resolution. The
+  rebuild uses points at the original's default 96 DPI: pixels = points × 96 / 72 (12 pt = 16 px), range
+  1–2000 pt like the original.
+
+## Magic Wand / Paint Bucket sampling
+- `ToolsSection` "SampleAllLayers" (0x06002adf), default off: compare colours on the active layer; on =
+  the whole picture. Rebuilt as the Sampling: Layer / Image choice.
+
 ## History (undo)
 - `HistoryStack.PushNewMemento` (paintdotnet.dll 0x0600010e): a new step clears the redo steps, is added to the
   stack and the stack is flushed (old steps go to disk); there is no step-count limit.

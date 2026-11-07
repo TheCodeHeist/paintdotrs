@@ -8,6 +8,9 @@ mod effects;
 mod io;
 mod raster;
 mod tools;
+mod clip;
+mod smart;
+mod fonts;
 #[cfg(test)]
 mod tests;
 
@@ -35,6 +38,17 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([800.0, 520.0])
             .with_app_id("paint-rs")
             .with_drag_and_drop(true),
+        // Native Wayland now has drag and drop and a picture clipboard (our addition to the window library).
+        // PAINT_RS_X11=1 runs through X11/XWayland instead.
+        event_loop_builder: Some(Box::new(|builder| {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            let has_x11 = std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty());
+            if has_x11 && std::env::var_os("PAINT_RS_X11").is_some() {
+                builder.with_x11();
+            }
+        })),
+        // Ctrl+C / Ctrl+X / Ctrl+V come to the app as keys; it handles pictures and passes text to text boxes.
+        clipboard_shortcuts: false,
         ..Default::default()
     };
     eframe::run_native(app::APP_NAME, options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, shot, files)))))

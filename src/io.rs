@@ -5,8 +5,11 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 pub const OPEN_EXTS: &[&str] = &["pxe", "png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff", "tga", "webp", "ico", "qoi"];
-pub const SAVE_EXTS: &[&str] = &["png", "pxe", "jpg", "bmp", "tga", "tiff", "webp", "gif", "qoi"];
-const MAGIC: &[u8; 8] = b"PXEASEL1";
+/// Flat formats for File > Export (always written as a separate copy).
+pub const EXPORT_EXTS: &[&str] = &["png", "jpg", "bmp", "tga", "tiff", "webp", "gif", "qoi"];
+/// Version 1: layers only. Version 2: layers may carry a smart object (source picture + placement).
+const MAGIC_V1: &[u8; 8] = b"PXEASEL1";
+const MAGIC: &[u8; 8] = b"PXEASEL2";
 
 pub fn file_name(p: &Path) -> String {
     p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Untitled".into())
@@ -29,7 +32,8 @@ pub fn open(path: &Path) -> Result<Document, String> {
         l.px = px;
         Document::from_layers(&file_name(path), w, h, vec![l], "Open Image")
     };
-    d.path = Some(path.to_path_buf());
+    // a layered project is saved back to itself; a flat picture is only the source and is never overwritten
+    if is_pxe { d.path = Some(path.to_path_buf()); } else { d.source = Some(path.to_path_buf()); }
     Ok(d)
 }
 
@@ -74,6 +78,19 @@ fn write_pxe(doc: &Document, path: &Path) -> Result<(), String> {
         put(&[l.visible as u8, l.opacity, l.blend.to_u8()])?;
         let raw: Vec<u8> = l.px.iter().flatten().copied().collect();
         put(&raw)?;
+        match &l.smart {
+            None => put(&[0])?,
+            Some(s) => {
+                put(&[1])?;
+                put(&(s.sw as u32).to_le_bytes())?;
+                put(&(s.sh as u32).to_le_bytes())?;
+                for v in [s.xf.cx, s.xf.cy, s.xf.sx, s.xf.sy, s.xf.angle] {
+                    put(&v.to_le_bytes())?;
+                }
+                let raw: Vec<u8> = s.src.iter().flatten().copied().collect();
+                put(&raw)?;
+            }
+        }
     }
     z.finish().map_err(|e| e.to_string())?;
     Ok(())
@@ -91,7 +108,9 @@ fn read_pxe(path: &Path) -> Result<(usize, usize, Vec<Layer>), String> {
         at += n;
         Ok(s)
     };
-    if take(8)? != MAGIC { return Err("Not a layered picture file.".into()); }
+    let magic = take(8)?.to_vec();
+    let v2 = magic == MAGIC;
+    if !v2 && magic != MAGIC_V1 { return Err("Not a layered picture file.".into()); }
     let u32le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize;
     let w = u32le(take(4)?);
     let h = u32le(take(4)?);
@@ -104,7 +123,21 @@ fn read_pxe(path: &Path) -> Result<(usize, usize, Vec<Layer>), String> {
         let meta = take(3)?.to_vec();
         let raw = take(w * h * 4)?;
         let px = raw.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
-        layers.push(Layer { name, visible: meta[0] != 0, opacity: meta[1], blend: BlendMode::from_u8(meta[2]), px });
+        let mut smart = None;
+        if v2 && take(1)?[0] == 1 {
+            let sw = u32le(take(4)?);
+            let sh = u32le(take(4)?);
+            if sw == 0 || sh == 0 || sw * sh > 400_000_000 { return Err("The layered file is damaged.".into()); }
+            let mut f = [0f32; 5];
+            for v in f.iter_mut() {
+                let b = take(4)?;
+                *v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+            let src: Vec<crate::doc::Px> = take(sw * sh * 4)?.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
+            let xf = crate::smart::Xform { cx: f[0], cy: f[1], sx: f[2], sy: f[3], angle: f[4] };
+            smart = Some(crate::smart::Smart::new(src, sw, sh, xf));
+        }
+        layers.push(Layer { name, visible: meta[0] != 0, opacity: meta[1], blend: BlendMode::from_u8(meta[2]), px, smart });
     }
     Ok((w, h, layers))
 }

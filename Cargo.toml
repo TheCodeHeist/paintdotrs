@@ -5,11 +5,14 @@ edition = "2024"
 
 [dependencies]
 ab_glyph = "0.2.32"
+arboard = { version = "3.7.0", features = ["wayland-data-control"] }
 eframe = "0.37.0"
 epaint_default_fonts = "0.37"
 flate2 = "1.1.11"
+fontdb = "0.24.0"
 image = "0.25.10"
 rayon = "1.12.0"
+winit = { version = "0.30.13", default-features = false, features = ["x11", "wayland"] }
 
 # Pixel work must be fast in every build, including quick test builds.
 [profile.dev]
@@ -22,3 +25,8 @@ opt-level = 3
 [profile.release]
 opt-level = 3
 codegen-units = 4
+
+# A copy of the window library with one change (vendor/winit/src/platform_impl/linux/x11/dnd.rs):
+# pictures dragged from a web browser (http/https/data: addresses) are passed to the app instead of dropped.
+[patch.crates-io]
+winit = { path = "vendor/winit" }

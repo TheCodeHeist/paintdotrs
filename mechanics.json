@@ -2,6 +2,24 @@
  "version": 1,
  "values": [
   {
+   "name": "text size unit",
+   "group": "text",
+   "value": "points at 96 DPI (pixels = pt x 96 / 72)",
+   "source": "paintdotnet.dll TextSection..ctor 0x06003575 (FontSizeMetric 0 = Points) + TextTool.GetSizedFontProperties 0x06001cf4"
+  },
+  {
+   "name": "move tool resampling",
+   "group": "transform",
+   "value": "exact copy for whole-pixel moves, high-quality cubic otherwise",
+   "source": "paintdotnet.dll MoveToolContentRenderer.GetEffectiveInterpolationMode 0x06001ed1 + ToolsSection..ctor 0x06002adf (default 5)"
+  },
+  {
+   "name": "edit menu shortcuts",
+   "group": "controls",
+   "value": "Ctrl+Shift+C copy merged, Ctrl+Shift+V paste into new layer, Ctrl+Alt+V paste into new image, Ctrl+Shift+Alt+C/V copy/paste selection",
+   "source": "paintdotnet.dll EditMenu..ctor 0x06000abc"
+  },
+  {
    "name": "launcher",
    "group": "program",
    "value": "paintdotnet.exe loads paintdotnet.dll via hostfxr",
@@ -346,6 +364,57 @@
    "value": 1536,
    "unit": "MB",
    "estimated": true
+  },
+  {
+   "name": "wheel zoom factor per notch",
+   "group": "view",
+   "value": 1.12,
+   "source": "paintdotnet.dll CanvasControl.ProcessVerticalPointerWheel 0x06002299"
+  },
+  {
+   "name": "wheel zoom snap to whole number",
+   "group": "view",
+   "value": 0.05,
+   "unit": "of zoom",
+   "source": "paintdotnet.dll CanvasControl.ProcessVerticalPointerWheel 0x06002299"
+  },
+  {
+   "name": "wheel scroll per notch",
+   "group": "view",
+   "value": 120,
+   "unit": "screen px",
+   "source": "paintdotnet.dll CanvasControl.ProcessVerticalPointerWheel 0x06002299"
+  },
+  {
+   "name": "number box steps per wheel notch",
+   "group": "controls",
+   "value": 3,
+   "source": "PaintDotNet.Framework.dll PdnNumericSpin.OnMouseWheel 0x0600077f"
+  },
+  {
+   "name": "touchpad pixels per notch",
+   "group": "view",
+   "value": 50,
+   "unit": "px",
+   "estimated": true
+  },
+  {
+   "name": "paste placement",
+   "group": "edit",
+   "value": "top-left of the visible area, kept inside view and canvas",
+   "source": "paintdotnet.dll PasteImageAction.PerformActionImpl 0x060028f4"
+  },
+  {
+   "name": "paste bigger than canvas",
+   "group": "edit",
+   "value": "ask: Expand canvas / Keep canvas size / Cancel",
+   "source": "paintdotnet.dll PasteImageAction.ShowExpandCanvasTaskDialog 0x060028f7"
+  },
+  {
+   "name": "drop with Shift",
+   "group": "files",
+   "value": "add dropped pictures as layers (the original's 'Add layers' choice)",
+   "source": "paintdotnet.dll MainForm.OnDragDropImpl 0x06001146"
   }
  ]
 }

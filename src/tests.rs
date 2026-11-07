@@ -222,3 +222,50 @@ fn history_shares_unchanged_layers() {
     d.undo();
     assert_eq!(d.s.layers[1].px[0], [0, 0, 0, 0]);
 }
+
+#[test]
+fn opened_pictures_are_never_the_save_target() {
+    let dir = std::env::temp_dir().join(format!("paint-rs-save-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("photo.png");
+    crate::io::save(&Document::new("t", 4, 3, [9, 9, 9, 255]), &png, 90).unwrap();
+    let d = crate::io::open(&png).unwrap();
+    assert!(d.path.is_none(), "Save must not write over the PNG it came from");
+    assert_eq!(d.source.as_deref(), Some(png.as_path()));
+    let pxe = dir.join("photo.pxe");
+    crate::io::save(&d, &pxe, 90).unwrap();
+    let p = crate::io::open(&pxe).unwrap();
+    assert_eq!(p.path.as_deref(), Some(pxe.as_path()), "a project saves back into itself");
+    // export names never collide with existing files
+    assert_eq!(crate::app::free_copy_name_for_tests(&dir, "photo", "png"), "photo copy");
+    crate::io::save(&d, &dir.join("photo copy.png"), 90).unwrap();
+    assert_eq!(crate::app::free_copy_name_for_tests(&dir, "photo", "png"), "photo copy 2");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn paste_lands_in_view_like_original() {
+    use crate::app::paste_origin;
+    assert_eq!(paste_origin(100, 100, None), (0, 0));
+    assert_eq!(paste_origin(100, 100, Some((0, 0, 800, 600))), (0, 0), "fits at the corner");
+    assert_eq!(paste_origin(100, 100, Some((300, 200, 700, 500))), (300, 200), "scrolled: top-left of the view");
+    assert_eq!(paste_origin(500, 100, Some((300, 200, 700, 500))), (200, 200), "too wide: ends at the view's right edge");
+    assert_eq!(paste_origin(900, 900, Some((300, 200, 700, 500))), (0, 0), "never above or left of the canvas");
+}
+
+#[test]
+fn magic_wand_is_fast_on_big_pictures() {
+    let (w, h) = (4000, 3000);
+    // big flat areas with a noisy band, like a photo with sky
+    let px: Vec<[u8; 4]> = (0..w * h).map(|i| {
+        let (x, y) = (i % w, i / w);
+        if y < 1500 { [100, 150, 230, 255] } else { [((x * 7 + y * 3) % 256) as u8, 120, 60, 255] }
+    }).collect();
+    let t = std::time::Instant::now();
+    let m = raster::flood_mask(&px, w, h, 10, 10, 0.5, false);
+    let outline = raster::mask_outline(&m, w, h);
+    let took = t.elapsed();
+    assert_eq!(m.iter().filter(|v| **v > 0).count(), 4000 * 1500, "selects exactly the flat sky");
+    assert!(!outline.is_empty());
+    assert!(took < std::time::Duration::from_millis(1500), "magic wand took {took:?}");
+}

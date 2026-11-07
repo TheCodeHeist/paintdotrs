@@ -127,7 +127,8 @@ def main(prog, libdir):
             f.write(b)
         os.chmod(tmp, os.stat(prog).st_mode)
         os.replace(tmp, prog)
-        print("glibc_compat: now asks for GLIBC_2.2.5 instead of " + ", ".join(changed), file=sys.stderr)
+        if os.environ.get("PAINT_RS_LINK_VERBOSE"):
+            print("glibc_compat: now asks for GLIBC_2.2.5 instead of " + ", ".join(changed), file=sys.stderr)
     return 0
 
 

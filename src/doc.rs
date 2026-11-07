@@ -141,11 +141,26 @@ pub struct Layer {
     pub opacity: u8,
     pub blend: BlendMode,
     pub px: Vec<Px>,
+    /// A smart object: the whole original picture and its placement; `px` is what shows on the canvas.
+    pub smart: Option<crate::smart::Smart>,
 }
 
 impl Layer {
     pub fn new(name: &str, w: usize, h: usize, fill: Px) -> Self {
-        Layer { name: name.into(), visible: true, opacity: 255, blend: BlendMode::Normal, px: vec![fill; w * h] }
+        Layer { name: name.into(), visible: true, opacity: 255, blend: BlendMode::Normal, px: vec![fill; w * h], smart: None }
+    }
+
+    /// A layer holding a smart object (shows the part of it inside the w x h canvas).
+    pub fn smart(name: &str, w: usize, h: usize, s: crate::smart::Smart) -> Self {
+        let px = s.render(w, h);
+        Layer { name: name.into(), visible: true, opacity: 255, blend: BlendMode::Normal, px, smart: Some(s) }
+    }
+
+    /// Redraw a smart layer after its placement or the canvas changed.
+    pub fn rerender(&mut self, w: usize, h: usize) {
+        if let Some(s) = &self.smart {
+            self.px = s.render(w, h);
+        }
     }
 }
 
@@ -179,7 +194,7 @@ impl Snapshot {
         let layers = s.layers.iter().enumerate().map(|(i, l)| {
             if same_size {
                 if let Some(old) = prev.and_then(|p| p.layers.get(i)) {
-                    if old.px == l.px && old.name == l.name && old.visible == l.visible && old.opacity == l.opacity && old.blend == l.blend {
+                    if old.px == l.px && old.smart == l.smart && old.name == l.name && old.visible == l.visible && old.opacity == l.opacity && old.blend == l.blend {
                         return Arc::clone(old);
                     }
                 }
@@ -227,7 +242,10 @@ pub const HISTORY_MEMORY_BUDGET: usize = 1536 * 1024 * 1024;
 
 pub struct Document {
     pub name: String,
+    /// the layered project file (.pxe) this picture is saved as, if any
     pub path: Option<std::path::PathBuf>,
+    /// the flat picture it was opened from (PNG, JPG...), never overwritten by Save
+    pub source: Option<std::path::PathBuf>,
     pub s: State,
     pub history: Vec<HistoryItem>,
     pub hist_pos: usize,
@@ -249,6 +267,7 @@ impl Document {
         let mut d = Document {
             name: name.into(),
             path: None,
+            source: None,
             s,
             history: vec![],
             hist_pos: 0,
@@ -268,7 +287,7 @@ impl Document {
 
     pub fn from_layers(name: &str, w: usize, h: usize, layers: Vec<Layer>, first: &str) -> Self {
         let s = State { w, h, layers, active: 0, selection: None };
-        let mut d = Document { name: name.into(), path: None, s, history: vec![], hist_pos: 0, dirty: false, version: 1, sel_version: 1, zoom: 1.0, pan: (0.0, 0.0), fit_pending: true, damage: None, full_dirty: true, sel_bounds_cache: std::cell::Cell::new((0, None)) };
+        let mut d = Document { name: name.into(), path: None, source: None, s, history: vec![], hist_pos: 0, dirty: false, version: 1, sel_version: 1, zoom: 1.0, pan: (0.0, 0.0), fit_pending: true, damage: None, full_dirty: true, sel_bounds_cache: std::cell::Cell::new((0, None)) };
         d.history.push(HistoryItem::first(first, &d.s));
         d
     }
