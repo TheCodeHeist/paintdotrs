@@ -65,14 +65,19 @@ pub fn save(doc: &Document, path: &Path, jpeg_quality: u8) -> Result<(), String>
 }
 
 fn write_pxe(doc: &Document, path: &Path) -> Result<(), String> {
+    write_layers(doc.w(), doc.h(), doc.s.layers.iter(), path, flate2::Compression::default())
+}
+
+/// Write layers as a project file (used by Save and by the autosave cache).
+pub fn write_layers<'a>(w: usize, h: usize, layers: impl ExactSizeIterator<Item = &'a Layer>, path: &Path, level: flate2::Compression) -> Result<(), String> {
     let f = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut z = flate2::write::ZlibEncoder::new(std::io::BufWriter::new(f), flate2::Compression::default());
+    let mut z = flate2::write::ZlibEncoder::new(std::io::BufWriter::new(f), level);
     let mut put = |b: &[u8]| z.write_all(b).map_err(|e| e.to_string());
     put(MAGIC)?;
-    put(&(doc.w() as u32).to_le_bytes())?;
-    put(&(doc.h() as u32).to_le_bytes())?;
-    put(&(doc.s.layers.len() as u32).to_le_bytes())?;
-    for l in &doc.s.layers {
+    put(&(w as u32).to_le_bytes())?;
+    put(&(h as u32).to_le_bytes())?;
+    put(&(layers.len() as u32).to_le_bytes())?;
+    for l in layers {
         put(&(l.name.len() as u32).to_le_bytes())?;
         put(l.name.as_bytes())?;
         put(&[l.visible as u8, l.opacity, l.blend.to_u8()])?;
@@ -96,7 +101,7 @@ fn write_pxe(doc: &Document, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn read_pxe(path: &Path) -> Result<(usize, usize, Vec<Layer>), String> {
+pub fn read_pxe(path: &Path) -> Result<(usize, usize, Vec<Layer>), String> {
     let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut z = flate2::read::ZlibDecoder::new(std::io::BufReader::new(f));
     let mut buf = Vec::new();

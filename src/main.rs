@@ -3,6 +3,7 @@
 //! Usage: pixel_easel [picture files...] [--screenshot out.png]
 
 mod app;
+mod autosave;
 mod doc;
 mod effects;
 mod io;

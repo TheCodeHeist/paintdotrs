@@ -415,6 +415,120 @@
    "group": "files",
    "value": "add dropped pictures as layers (the original's 'Add layers' choice)",
    "source": "paintdotnet.dll MainForm.OnDragDropImpl 0x06001146"
+  },
+  {
+   "name": "auto-level dark point",
+   "group": "adjustments",
+   "value": "0.5 % histogram point per channel (first bin where the running count exceeds 0.005 x total)",
+   "source": "PaintDotNet.Effects.Legacy.dll HistogramRgbLegacy.MakeLevelsAuto 0x060000f9 + HistogramLegacy.GetPercentile 0x060000ec"
+  },
+  {
+   "name": "auto-level bright point",
+   "group": "adjustments",
+   "value": "99.5 % histogram point per channel",
+   "source": "PaintDotNet.Effects.Legacy.dll HistogramRgbLegacy.MakeLevelsAuto 0x060000f9"
+  },
+  {
+   "name": "auto-level middle",
+   "group": "adjustments",
+   "value": "mean of the channel's histogram + 0.5, truncated to a byte",
+   "source": "PaintDotNet.Effects.Legacy.dll HistogramRgbLegacy.GetMeanColor 0x060000f5 + HistogramLegacy.GetMean 0x060000eb"
+  },
+  {
+   "name": "auto-level gamma",
+   "group": "adjustments",
+   "value": "clamp(log(0.5) / log((mean - lo) / (hi - lo)), 0.1, 10); 1 unless lo < mean < hi",
+   "source": "PaintDotNet.Effects.Legacy.dll LevelOpLegacy.AutoFromLoMidHi 0x0600012d"
+  },
+  {
+   "name": "auto-level measured area",
+   "group": "adjustments",
+   "value": "the selection only",
+   "source": "PaintDotNet.Effects.Legacy.dll AutoLevelEffect.OnSetRenderInfo 0x0600000c (GetSelectionAsScans)"
+  },
+  {
+   "name": "drop shadow blur radius",
+   "group": "effects",
+   "value": "10 (0..100)",
+   "source": "PaintDotNet.Effects.Gpu.dll DropShadowGpuEffect.OnCreatePropertyCollection 0x060002b6"
+  },
+  {
+   "name": "drop shadow distance",
+   "group": "effects",
+   "value": "10 (0..100)",
+   "source": "PaintDotNet.Effects.Gpu.dll DropShadowGpuEffect.OnCreatePropertyCollection 0x060002b6"
+  },
+  {
+   "name": "drop shadow angle",
+   "group": "effects",
+   "value": "-45 degrees (-180..180), i.e. down-right",
+   "source": "PaintDotNet.Effects.Gpu.dll DropShadowGpuEffect.OnCreatePropertyCollection 0x060002b6"
+  },
+  {
+   "name": "drop shadow opacity",
+   "group": "effects",
+   "value": "0.75 (0..1)",
+   "source": "PaintDotNet.Effects.Gpu.dll DropShadowGpuEffect.OnCreatePropertyCollection 0x060002b6"
+  },
+  {
+   "name": "drop shadow colour",
+   "group": "effects",
+   "value": "black (0x000000)",
+   "source": "PaintDotNet.Effects.Gpu.dll DropShadowGpuEffect.OnCreatePropertyCollection 0x060002b6"
+  },
+  {
+   "name": "drop shadow shadow only",
+   "group": "effects",
+   "value": "off",
+   "source": "PaintDotNet.Effects.Gpu.dll DropShadowGpuEffect.OnCreatePropertyCollection 0x060002b6"
+  },
+  {
+   "name": "floating window keys",
+   "group": "ui",
+   "value": "Tools F5, History F6, Layers F7, Colors F8",
+   "estimated": true
+  },
+  {
+   "name": "autosave interval",
+   "group": "files",
+   "value": "60 seconds",
+   "estimated": true
+  },
+  {
+   "name": "arrow key nudge",
+   "group": "tools",
+   "value": "1 pixel per press, 10 with Ctrl; a run of presses is one step after 500 ms idle",
+   "source": "paintdotnet.dll TransformControl.ProcessArrowKey 0x060020e6 + TransformControl.OnKeyDown 0x060020e5"
+  },
+  {
+   "name": "move tool Enter/Escape",
+   "group": "tools",
+   "value": "both commit the moved pixels and deselect; Escape mid-drag cancels the drag",
+   "source": "paintdotnet.dll MoveTool.OnUIPreviewKeyDown 0x06001e9c + TransformControl.OnKeyDown 0x060020e5"
+  },
+  {
+   "name": "clone stamp alignment",
+   "group": "tools",
+   "value": "offset fixed at the first stroke after Ctrl+click and kept for every later stroke",
+   "source": "paintdotnet.dll CloneStampTool.OnUIDragBegin 0x06002155"
+  },
+  {
+   "name": "clone stamp source layer",
+   "group": "tools",
+   "value": "the layer active at Ctrl+click",
+   "source": "paintdotnet.dll CloneStampTool.OnUIDragBegin 0x06002155 + GetAnchorLayerIndex 0x0600215b"
+  },
+  {
+   "name": "clone stamp without source",
+   "group": "tools",
+   "value": "stroke does nothing",
+   "source": "paintdotnet.dll CloneStampTool.OnUIDragBegin 0x06002155 (mode 0 branch)"
+  },
+  {
+   "name": "clone stamp marker radius",
+   "group": "tools",
+   "value": "brush width / 2",
+   "source": "paintdotnet.dll CloneStampTool.UpdateAnchor 0x0600214e"
   }
  ]
 }

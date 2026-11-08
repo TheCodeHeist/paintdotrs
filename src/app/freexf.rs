@@ -9,6 +9,7 @@ use super::*;
 use crate::smart::{self, Grip, Smart, Xform};
 
 /// Selected pixels lifted off their layer while they're being transformed.
+#[allow(dead_code)]
 pub(super) struct Floating {
     pub doc: usize,
     pub layer: usize,
@@ -34,6 +35,10 @@ pub(super) struct Floating {
     /// every placement it has had (one per finished drag), for undo/redo while it floats
     pub steps: Vec<Xform>,
     pub step: usize,
+    /// the placement last drawn on the layer: outside its box the layer equals `base`
+    pub shown: Xform,
+    /// a history step has been recorded for it (every paste, move and transform is recorded at once)
+    pub committed: bool,
 }
 
 pub(super) struct XDrag {
@@ -107,7 +112,7 @@ impl App {
         let xf = Xform::at(x0 as f32, y0 as f32, sw, sh);
         d.s.selection = None; // the transform box shows the selection while it floats
         d.sel_version += 1;
-        self.floating = Some(Floating { doc: self.cur, layer: a, src, sw, sh, mask_src, xf, xf0: xf, base, before_px, sel_before: sel, ver: 0, pasted: false, added_layer: false, label: "Move Selected Pixels".into(), steps: vec![xf], step: 0 });
+        self.floating = Some(Floating { doc: self.cur, layer: a, src, sw, sh, mask_src, xf, xf0: xf, base, before_px, sel_before: sel, ver: 0, pasted: false, added_layer: false, label: "Move Selected Pixels".into(), steps: vec![xf], step: 0, shown: xf, committed: false });
         self.render_floating();
         true
     }
@@ -117,9 +122,17 @@ impl App {
         let d = &mut self.docs[f.doc];
         let (w, h) = (d.w(), d.h());
         let Some(layer) = d.s.layers.get_mut(f.layer) else { return };
-        layer.px.copy_from_slice(&f.base);
+        // only the old and new boxes change: put the base back there and draw the picture again
+        let area = union_box(smart::canvas_box(f.sw, f.sh, &f.shown, w, h), smart::canvas_box(f.sw, f.sh, &f.xf, w, h));
+        if let Some((x0, y0, x1, y1)) = area {
+            for y in y0..y1 {
+                let r = y * w + x0..y * w + x1;
+                layer.px[r.clone()].copy_from_slice(&f.base[r]);
+            }
+        }
         smart::draw(&mut layer.px, w, h, &f.src, f.sw, f.sh, &f.xf, None);
-        d.mark_full();
+        f.shown = f.xf;
+        match area { Some(a) => d.mark_rect(a), None => d.version += 1 }
         f.ver = d.version;
     }
 
@@ -133,10 +146,10 @@ impl App {
             return;
         }
         if f.ver != d.version {
-            // something else changed the picture meanwhile; keep what's there
+            // something else changed the picture meanwhile (or history moved); keep what's there
             return;
         }
-        if f.xf == f.xf0 && !f.pasted {
+        if f.xf == f.xf0 && !f.pasted && !f.committed {
             d.s.layers[f.layer].px = f.before_px;
             d.s.selection = f.sel_before;
             d.touch();
@@ -157,7 +170,27 @@ impl App {
             d.s.active = f.layer + 1;
         }
         d.s.selection = new_sel;
-        d.commit(&f.label);
+        d.commit("Finish Pixels");
+    }
+
+    /// Record the floating picture's current placement as a finished history step. The picture keeps its
+    /// handles (and its whole source, so later resizes stay sharp) until it's put down.
+    pub(super) fn commit_floating(&mut self, label: &str) {
+        let Some(f) = self.floating.as_mut() else { return };
+        let Some(d) = self.docs.get_mut(f.doc) else { return };
+        if f.ver != d.version { return; }
+        d.commit_quiet(label);
+        f.ver = d.version;
+        f.committed = true;
+    }
+
+    /// Drop the transform handles without recording anything (the history already has every step). Lifted
+    /// pixels that were never moved go back as they were.
+    pub(super) fn release_floating(&mut self) {
+        let Some(f) = &self.floating else { return };
+        if !f.committed { self.cancel_floating(); return; }
+        self.floating = None;
+        self.xdrag = None;
     }
 
     /// Put the floating pixels back where they were (Escape, Undo).
@@ -182,56 +215,24 @@ impl App {
 
     /// Undo: while a picture floats, step back through its transforms first; the first step (the paste or
     /// lift itself) takes it away. Otherwise the picture's history.
+    /// Every action is already a finished history step, so Undo simply goes one step back (the handles of a
+    /// floating picture are let go first).
     pub(super) fn undo(&mut self) {
-        if let Some(f) = self.floating.as_mut() {
-            if f.doc == self.cur {
-                if f.step > 0 {
-                    f.step -= 1;
-                    let xf = f.steps[f.step];
-                    self.apply_xform(xf);
-                } else {
-                    self.cancel_floating();
-                }
-                return;
-            }
-        }
-        self.finish_floating();
+        self.release_floating();
         self.doc().undo();
     }
 
-    /// Redo: while a picture floats, step forward through its transforms.
     pub(super) fn redo(&mut self) {
-        if let Some(f) = self.floating.as_mut() {
-            if f.doc == self.cur {
-                if f.step + 1 < f.steps.len() {
-                    f.step += 1;
-                    let xf = f.steps[f.step];
-                    self.apply_xform(xf);
-                }
-                return;
-            }
-        }
+        self.release_floating();
         self.doc().redo();
     }
 
-    /// The floating picture's steps for the History panel: (names, current index).
+    /// No separate floating steps: everything is in the picture's own history.
     pub(super) fn floating_steps(&self) -> Option<(Vec<String>, usize)> {
-        let f = self.floating.as_ref().filter(|f| f.doc == self.cur)?;
-        let mut names = vec![f.label.clone()];
-        names.extend((1..f.steps.len()).map(|_| "Free Transform".to_string()));
-        Some((names, f.step))
+        None
     }
 
-    /// Jump to one of the floating picture's steps (History panel).
-    pub(super) fn floating_goto(&mut self, i: usize) {
-        if let Some(f) = self.floating.as_mut() {
-            if i < f.steps.len() {
-                f.step = i;
-                let xf = f.steps[i];
-                self.apply_xform(xf);
-            }
-        }
-    }
+    pub(super) fn floating_goto(&mut self, _i: usize) {}
 
     /// Change the placement of what's being transformed.
     pub(super) fn apply_xform(&mut self, xf: Xform) {
@@ -244,9 +245,14 @@ impl App {
         let (w, h) = (d.w(), d.h());
         let l = d.layer_mut();
         if let Some(s) = l.smart.as_mut() {
+            // clear the old and new boxes and draw it again there, instead of the whole layer
+            let area = union_box(smart::canvas_box(s.sw, s.sh, &s.xf, w, h), smart::canvas_box(s.sw, s.sh, &xf, w, h));
             s.xf = xf;
-            l.rerender(w, h);
-            d.mark_full();
+            if let Some((x0, y0, x1, y1)) = area {
+                for y in y0..y1 { l.px[y * w + x0..y * w + x1].fill([0, 0, 0, 0]); }
+                smart::draw(&mut l.px, w, h, &s.src, s.sw, s.sh, &s.xf, None);
+                d.mark_rect((x0, y0, x1, y1));
+            }
         }
     }
 
@@ -268,12 +274,11 @@ impl App {
 
     pub(super) fn xform_release(&mut self) {
         let Some(x) = self.xdrag.take() else { return };
-        if let Some(f) = self.floating.as_mut() {
-            // each finished drag is one undo step while the picture floats
-            if f.steps.get(f.step) != Some(&f.xf) {
-                f.steps.truncate(f.step + 1);
-                f.steps.push(f.xf);
-                f.step = f.steps.len() - 1;
+        if let Some(f) = self.floating.as_ref() {
+            // each finished drag is a history step of its own, right away
+            if f.xf != x.xf0 {
+                let label = if x.grip == Grip::Move { "Move Selected Pixels" } else { "Free Transform" };
+                self.commit_floating(label);
             }
             return;
         }
@@ -300,9 +305,26 @@ impl App {
     /// Draw the transform box with its handles.
     pub(super) fn draw_xform_box(&self, painter: &egui::Painter, to_scr: &dyn Fn(f32, f32) -> (f32, f32)) {
         let Some((xf, sw, sh)) = self.xform_target() else { return };
+        draw_box(painter, to_scr, &xf, sw, sh, self.theme().accent);
+    }
+
+    /// Painting on a smart object needs it turned into ordinary pixels first. Returns true when it's
+    /// a smart object (and asks the person).
+    pub(super) fn smart_guard(&mut self) -> bool {
+        if self.docs[self.cur].layer().smart.is_some() {
+            self.dialog = Some(Dialog::Rasterize);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The transform box with its corner, edge and rotate handles.
+pub(super) fn draw_box(painter: &egui::Painter, to_scr: &dyn Fn(f32, f32) -> (f32, f32), xf: &Xform, sw: usize, sh: usize, accent: Color32) {
+    {
         let cs = xf.corners(sw, sh).map(|(x, y)| to_scr(x, y));
         let pts: Vec<Pos2> = cs.iter().chain(std::iter::once(&cs[0])).map(|p| pos2(p.0, p.1)).collect();
-        let accent = self.theme().accent;
         painter.add(egui::Shape::line(pts.clone(), Stroke::new(1.0, Color32::WHITE)));
         painter.extend(egui::Shape::dashed_line(&pts, Stroke::new(1.0, accent), 5.0, 3.0));
         let rh = smart::rotate_handle(&cs);
@@ -320,18 +342,9 @@ impl App {
             painter.rect_stroke(r, 1.0, Stroke::new(1.0, accent), egui::StrokeKind::Inside);
         }
     }
+}
 
-    /// Painting on a smart object needs it turned into ordinary pixels first. Returns true when it's
-    /// a smart object (and asks the person).
-    pub(super) fn smart_guard(&mut self) -> bool {
-        if self.docs[self.cur].layer().smart.is_some() {
-            self.dialog = Some(Dialog::Rasterize);
-            true
-        } else {
-            false
-        }
-    }
-
+impl App {
     /// Turn the active smart object into ordinary pixels (what's outside the canvas is dropped).
     pub(super) fn rasterize_layer(&mut self) {
         self.finish_floating();
@@ -345,7 +358,7 @@ impl App {
     /// Bring in a picture from outside (paste, drop, import) as floating pixels with the transform handles on.
     /// It keeps its whole picture while it floats; when it's deselected it becomes ordinary pixels of the
     /// layer, and only what sticks out past the canvas is kept as a smart object (so nothing is cut off).
-    pub(super) fn float_picture(&mut self, pic: clip::Picture, label: &str, at: (usize, usize), new_layer: bool) {
+    pub(super) fn float_picture(&mut self, pic: clip::Picture, label: &str, at: (usize, usize), new_layer: bool, name: Option<String>) {
         self.finish_floating();
         // a smart object layer can't take loose pixels: paste above it
         let new_layer = new_layer || self.docs[self.cur].layer().smart.is_some();
@@ -381,13 +394,30 @@ impl App {
             label: label.to_string(),
             steps: vec![xf],
             step: 0,
+            shown: xf,
+            committed: false,
         });
         self.render_floating();
+        if let Some(n) = name {
+            let d = self.doc();
+            let a = d.s.active;
+            d.s.layers[a].name = n;
+        }
+        // the paste is a finished step of its own, right away
+        self.commit_floating(label);
         self.tool = Tool::MovePixels;
     }
 }
 
-fn grip_cursor(g: Grip) -> egui::CursorIcon {
+fn union_box(a: Option<(usize, usize, usize, usize)>, b: Option<(usize, usize, usize, usize)>) -> Option<(usize, usize, usize, usize)> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some((a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
+pub(super) fn grip_cursor(g: Grip) -> egui::CursorIcon {
     match g {
         Grip::Move => egui::CursorIcon::Move,
         Grip::Rotate => egui::CursorIcon::Grab,

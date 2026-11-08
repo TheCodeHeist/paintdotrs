@@ -106,6 +106,11 @@ fn read_all(mut pipe: ReadPipe, timeout: Duration) -> Option<Vec<u8>> {
 /// The types the current clipboard offers (empty when unknown).
 pub fn clipboard_types() -> Vec<String> {
     let guard = SHARED.lock().unwrap();
+    // while we own the clipboard (until another program takes it and ours is cancelled), it holds our
+    // data, even before the compositor has told us about our own new selection
+    if let Some((_, items)) = guard.as_ref().and_then(|s| s.source.as_ref()) {
+        return items.iter().map(|(m, _)| m.clone()).collect();
+    }
     match guard.as_ref().and_then(|s| s.selection.as_ref()) {
         Some(offer) => offer.with_mime_types(|m| m.to_vec()),
         None => Vec::new(),

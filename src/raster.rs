@@ -26,6 +26,8 @@ pub struct Coverage {
     /// box touched since `take_recent` was last called
     rmin: (i32, i32),
     rmax: (i32, i32),
+    /// share of the brush radius painted solid before the edge fades (0..1)
+    pub hardness: f32,
 }
 
 impl Coverage {
@@ -39,7 +41,7 @@ impl Coverage {
         let ex = x1.clamp(0, w as i32) as usize;
         let ey = y1.clamp(0, h as i32) as usize;
         let (cw, ch) = (ex.saturating_sub(ox), ey.saturating_sub(oy));
-        Coverage { w, h, ox, oy, cw, ch, c: vec![0; cw * ch], min: (i32::MAX, i32::MAX), max: (i32::MIN, i32::MIN), rmin: (i32::MAX, i32::MAX), rmax: (i32::MIN, i32::MIN) }
+        Coverage { w, h, ox, oy, cw, ch, c: vec![0; cw * ch], min: (i32::MAX, i32::MAX), max: (i32::MIN, i32::MIN), rmin: (i32::MAX, i32::MAX), rmax: (i32::MIN, i32::MIN), hardness: BRUSH_HARDNESS }
     }
     fn grow(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
         self.min.0 = self.min.0.min(x0);
@@ -121,8 +123,8 @@ impl Coverage {
                 let d = (dx * dx + dy * dy).sqrt();
                 let v = if aa {
                     let edge = (r - d + 0.5).clamp(0.0, 1.0);
-                    let inner = r * BRUSH_HARDNESS;
-                    let soft = if r >= 2.0 && d > inner { (1.0 - (d - inner) / (r - inner)).clamp(0.0, 1.0) } else { 1.0 };
+                    let inner = r * self.hardness.clamp(0.0, 1.0);
+                    let soft = if r >= 2.0 && d > inner && inner < r { (1.0 - (d - inner) / (r - inner)).clamp(0.0, 1.0) } else { 1.0 };
                     (edge * soft * 255.0) as u8
                 } else if d <= r { 255 } else { 0 };
                 if v > 0 {

@@ -269,3 +269,68 @@ fn magic_wand_is_fast_on_big_pictures() {
     assert!(!outline.is_empty());
     assert!(took < std::time::Duration::from_millis(1500), "magic wand took {took:?}");
 }
+
+#[test]
+fn shift_keeps_proportions_on_edge_handles_too() {
+    use crate::smart::{drag, Grip, Xform};
+    let xf0 = Xform::at(0.0, 0.0, 100, 50);
+    // drag the right edge 100 px further out with Shift: twice as wide and twice as tall
+    let xf = drag(Grip::Edge(1), &xf0, 100, 50, (100.0, 25.0), (200.0, 25.0), true);
+    assert!((xf.sx - 2.0).abs() < 1e-3 && (xf.sy - 2.0).abs() < 1e-3, "{xf:?}");
+    // the left edge stays put
+    let left = xf.apply(-50.0, 0.0);
+    assert!(left.0.abs() < 1e-3);
+    // without Shift only the width changes
+    let xf = drag(Grip::Edge(1), &xf0, 100, 50, (100.0, 25.0), (200.0, 25.0), false);
+    assert!((xf.sy - 1.0).abs() < 1e-3);
+}
+
+#[test]
+fn auto_level_stretches_like_the_original() {
+    // greys from 50 to 150, mean 100: ends become black and white, the middle stays in the middle
+    let px: Vec<[u8; 4]> = (0..=100).map(|i| { let v = 50 + i as u8; [v, v, v, 255] }).collect();
+    let out = crate::effects::auto_level(&px, None);
+    assert_eq!(out[0][0], 0);
+    assert_eq!(out[100][0], 255);
+    let mid = out[50][0] as i32;
+    assert!((mid - 127).abs() <= 2, "mid {mid}");
+    // only the selection is measured
+    let mut mask = vec![0u8; px.len()];
+    for m in mask.iter_mut().take(51) { *m = 255; }
+    let out = crate::effects::auto_level(&px, Some(&mask));
+    assert_eq!(out[50][0], 255, "the selected part's brightest grey becomes white");
+}
+
+#[test]
+fn drop_shadow_falls_down_right_by_default() {
+    let (w, h) = (40, 40);
+    let mut px = vec![[0u8; 4]; w * h];
+    for y in 10..20 { for x in 10..20 { px[y * w + x] = [255, 0, 0, 255]; } }
+    let vals: Vec<f32> = Fx::DropShadow.params().iter().map(|p| p.default).collect();
+    let out = apply(Fx::DropShadow, &px, w, h, &vals, [0, 0, 0, 255], [255; 4]);
+    // the object itself is unchanged, its shadow shows below-right of it and not above-left
+    assert_eq!(out[15 * w + 15], [255, 0, 0, 255]);
+    assert!(out[24 * w + 24][3] > 60, "shadow below right: {:?}", out[24 * w + 24]);
+    assert_eq!(out[6 * w + 6][3], 0);
+}
+
+#[test]
+fn own_copies_are_recognised_by_fingerprint() {
+    let a = vec![[1u8, 2, 3, 255], [9, 9, 9, 0]];
+    let b = vec![[1u8, 2, 3, 255], [0, 0, 0, 0]];
+    assert_eq!(crate::app::fingerprint(&a), crate::app::fingerprint(&b), "invisible pixels don't count");
+    let c = vec![[1u8, 2, 4, 255], [0, 0, 0, 0]];
+    assert_ne!(crate::app::fingerprint(&a), crate::app::fingerprint(&c));
+}
+
+#[test]
+fn brush_hardness_changes_the_edge() {
+    let mut hard = Coverage::new(40, 40);
+    hard.hardness = 1.0;
+    hard.dab(20.0, 20.0, 20.0, true);
+    let mut soft = Coverage::new(40, 40);
+    soft.hardness = 0.0;
+    soft.dab(20.0, 20.0, 20.0, true);
+    assert!(hard.get(27, 20) > soft.get(27, 20));
+    assert_eq!(hard.get(20, 20), 255);
+}

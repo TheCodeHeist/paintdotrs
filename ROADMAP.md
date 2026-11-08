@@ -22,8 +22,8 @@ Status: not started unless marked.
    the original's Layer / Image sampling choice.
 
 ## Added on request (2026-11-07)
-- Undo/Redo step through each move/resize/rotate of a floating picture; the paste only goes away after
-  the last undo. These steps show in History (in italics) until the picture is put down.
+- Every action is final at once (2026-11-08): paste, each move/resize/rotate, each arrow press and each
+  stroke (Clone Stamp included) is its own History step immediately; nothing waits for Enter.
 - History steps have icons: the tool that made the step, or a symbol for selection, layer, whole-picture,
   effect and file steps.
 
@@ -35,3 +35,23 @@ Status: not started unless marked.
 12. ✅ Done: saving keeps the work as a layered project file (.pxe) and asks where; overwrite only when asked.
 13. ✅ Done: exporting to PNG/JPG/... always writes a copy and never overwrites the opened file unless the person
     explicitly chooses to.
+
+## Round 2 (received 2026-11-08), version 0.1.1
+1. ✅ Palette colours have a white outline in dark mode and a black one in light mode.
+2. ✅ Tools, Colors, History and Layers are floating windows: draggable, resizable, closable, back from View
+   (F5–F8); slim title bars.
+3. ✅ Dropping or importing a picture bigger than the canvas asks Expand canvas / Keep canvas size.
+4. ✅ Faster on big pictures: moving pasted pictures and smart objects redraws only what changed; strokes and
+   selections no longer redraw the whole picture when they finish.
+5. ✅ Layers can be dragged to a new place in the list.
+6. ✅ Autosave every minute to a cache; recovery offered after a crash or power cut.
+7. ✅ Shift keeps proportions on the side handles too.
+8. ✅ A copied area pastes back in the same place (e.g. on another layer).
+9. ✅ Arrow keys nudge with the move tools (Ctrl = 10 px, like the original), otherwise scroll.
+10. ✅ Move Selection has free transform handles (move, resize, rotate the selection).
+11. ✅ Brush hardness slider in the toolbar.
+12. ✅ Auto-Level now works like the original (0.5 % / 99.5 % points and the mean, per channel, selection only).
+13. ✅ Adjustment and effect windows can be dragged anywhere.
+14. ✅ Font preview ("Lorem ipsum") of the font under the pointer in the font list.
+15. ✅ Clicking the font search box no longer closes the font list.
+16. ✅ Drop Shadow (Effects > Object) with the original's defaults.

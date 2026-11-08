@@ -26,6 +26,7 @@ pub enum Fx {
     Emboss,
     EdgeDetect,
     Clouds,
+    DropShadow,
 }
 
 pub struct Param {
@@ -45,10 +46,11 @@ impl Fx {
         Fx::AutoLevel, Fx::BlackAndWhite, Fx::BrightnessContrast, Fx::HueSaturation, Fx::InvertColors,
         Fx::InvertAlpha, Fx::Levels, Fx::Posterize, Fx::Sepia,
     ];
-    pub const EFFECTS: [(&'static str, &'static [Fx]); 6] = [
+    pub const EFFECTS: [(&'static str, &'static [Fx]); 7] = [
         ("Blurs", &[Fx::GaussianBlur, Fx::MotionBlur]),
         ("Distort", &[Fx::Bulge, Fx::Pixelate, Fx::Twist]),
         ("Noise", &[Fx::AddNoise]),
+        ("Object", &[Fx::DropShadow]),
         ("Photo", &[Fx::Sharpen, Fx::Vignette]),
         ("Render", &[Fx::Clouds]),
         ("Stylize", &[Fx::EdgeDetect, Fx::Emboss]),
@@ -76,6 +78,7 @@ impl Fx {
             Fx::Emboss => "Emboss",
             Fx::EdgeDetect => "Edge Detect",
             Fx::Clouds => "Clouds",
+            Fx::DropShadow => "Drop Shadow",
         }
     }
 
@@ -95,6 +98,8 @@ impl Fx {
             Fx::Vignette => vec![p("Radius", 10.0, 200.0, 50.0, true), p("Density", 0.0, 100.0, 100.0, true)],
             Fx::Emboss | Fx::EdgeDetect => vec![p("Angle", -180.0, 180.0, 45.0, true)],
             Fx::Clouds => vec![p("Scale", 2.0, 1000.0, 250.0, true), p("Roughness", 0.0, 100.0, 50.0, true), p("Seed", 0.0, 9999.0, 0.0, true)],
+            // DropShadowGpuEffect.OnCreatePropertyCollection (PaintDotNet.Effects.Gpu.dll 0x060002b6)
+            Fx::DropShadow => vec![p("Blur radius", 0.0, 100.0, 10.0, true), p("Distance", 0.0, 100.0, 10.0, true), p("Angle", -180.0, 180.0, -45.0, true), p("Opacity %", 0.0, 100.0, 75.0, true), p("Shadow only (1 = on)", 0.0, 1.0, 0.0, true)],
             _ => vec![],
         }
     }
@@ -233,6 +238,71 @@ fn value_noise(x: f32, y: f32, seed: u32) -> f32 {
     top + (bot - top) * sm(ty)
 }
 
+/// Auto-Level, as the original's `HistogramRgbLegacy.MakeLevelsAuto` (PaintDotNet.Effects.Legacy.dll
+/// 0x060000f9) and `LevelOpLegacy.AutoFromLoMidHi` (0x0600012d): per channel, a histogram of the selected
+/// pixels gives the dark end (0.5 % point), the bright end (99.5 % point) and the mean; the channel is then
+/// stretched so the ends become black and white, with a gamma that puts the mean in the middle:
+/// gamma = clamp(log(0.5) / log((mean - lo) / (hi - lo)), 0.1, 10), or 1 when lo < mean < hi doesn't hold.
+/// Fully transparent pixels are left out of the histogram (our addition: they have no visible colour).
+pub fn auto_level(px: &[Px], mask: Option<&[u8]>) -> Vec<Px> {
+    let mut hist = [[0u64; 256]; 3];
+    for (i, p) in px.iter().enumerate() {
+        if p[3] == 0 { continue; }
+        if let Some(m) = mask { if m[i] == 0 { continue; } }
+        for c in 0..3 { hist[c][p[c] as usize] += 1; }
+    }
+    let total: u64 = hist[0].iter().sum();
+    if total == 0 { return px.to_vec(); }
+    // HistogramLegacy.GetPercentile: the first bin where the running count exceeds total * fraction
+    let percentile = |h: &[u64; 256], f: f32| -> f32 {
+        let mut run = 0u64;
+        for (i, n) in h.iter().enumerate() { run += n; if run as f32 > total as f32 * f { return i as f32; } }
+        255.0
+    };
+    let mut tables = [[0u8; 256]; 3];
+    for c in 0..3 {
+        let lo = percentile(&hist[c], 0.005);
+        let hi = percentile(&hist[c], 0.995);
+        // GetMeanColor: mean + 0.5, truncated to a byte
+        let mean = hist[c].iter().enumerate().map(|(i, n)| i as u64 * n).sum::<u64>() as f32 / total as f32;
+        let mid = (mean + 0.5).floor().min(255.0);
+        let gamma = if lo < mid && mid < hi { (0.5f64.ln() / (((mid - lo) / (hi - lo)) as f64).ln()).clamp(0.1, 10.0) } else { 1.0 };
+        for v in 0..256 {
+            let x = v as f32;
+            tables[c][v] = if hi <= lo { v as u8 } else if x <= lo { 0 } else if x >= hi { 255 } else {
+                (255.0 * (((x - lo) / (hi - lo)) as f64).powf(gamma)).clamp(0.0, 255.0) as u8
+            };
+        }
+    }
+    px.iter().map(|p| [tables[0][p[0] as usize], tables[1][p[1] as usize], tables[2][p[2] as usize], p[3]]).collect()
+}
+
+/// Drop shadow under the layer's objects: the layer's shape (its transparency), moved `distance` pixels
+/// towards `angle` (degrees, counter-clockwise from the right, so -45 is down-right), blurred by `blur`
+/// and drawn in `color` at `opacity` behind the layer (or alone with `shadow_only`). Needs a layer with
+/// transparency, like the original says.
+pub fn drop_shadow(px: &[Px], w: usize, h: usize, blur: f32, distance: f32, angle: f32, opacity: f32, shadow_only: bool, color: Px) -> Vec<Px> {
+    let a = angle.to_radians();
+    let (dx, dy) = ((a.cos() * distance).round() as i64, (-a.sin() * distance).round() as i64);
+    let mut shape = vec![[0u8, 0, 0, 0]; w * h];
+    for y in 0..h as i64 {
+        let sy = y - dy;
+        if sy < 0 || sy >= h as i64 { continue; }
+        for x in 0..w as i64 {
+            let sx = x - dx;
+            if sx < 0 || sx >= w as i64 { continue; }
+            let al = px[sy as usize * w + sx as usize][3];
+            shape[y as usize * w + x as usize] = [color[0], color[1], color[2], al];
+        }
+    }
+    let blurred = gaussian_blur(&shape, w, h, blur.max(0.0) as usize);
+    let op = opacity.clamp(0.0, 1.0) * color[3] as f32 / 255.0;
+    blurred.iter().zip(px.iter()).map(|(s, p)| {
+        let sh = [color[0], color[1], color[2], (s[3] as f32 * op).round() as u8];
+        if shadow_only { sh } else { crate::doc::over(sh, *p, 255) }
+    }).collect()
+}
+
 /// Run an effect. `prim`/`sec` are the palette colours (used by Clouds).
 pub fn apply(fx: Fx, px: &[Px], w: usize, h: usize, v: &[f32], prim: Px, sec: Px) -> Vec<Px> {
     let vi = |i: usize| v.get(i).copied().unwrap_or(0.0);
@@ -262,20 +332,8 @@ pub fn apply(fx: Fx, px: &[Px], w: usize, h: usize, v: &[f32], prim: Px, sec: Px
             }).collect();
             px.iter().map(|p| [t[p[0] as usize], t[p[1] as usize], t[p[2] as usize], p[3]]).collect()
         }
-        Fx::AutoLevel => {
-            let mut lo = [255u8; 3];
-            let mut hi = [0u8; 3];
-            for p in px.iter().filter(|p| p[3] > 0) {
-                for c in 0..3 { lo[c] = lo[c].min(p[c]); hi[c] = hi[c].max(p[c]); }
-            }
-            px.iter().map(|p| {
-                let mut o = *p;
-                for c in 0..3 {
-                    if hi[c] > lo[c] { o[c] = clamp8((p[c] - lo[c]) as f32 * 255.0 / (hi[c] - lo[c]) as f32); }
-                }
-                o
-            }).collect()
-        }
+        Fx::AutoLevel => auto_level(px, None),
+        Fx::DropShadow => drop_shadow(px, w, h, vi(0), vi(1), vi(2), vi(3) / 100.0, vi(4) >= 0.5, [0, 0, 0, 255]),
         Fx::HueSaturation => {
             let mut sat = vi(1) as i32;
             if sat > 100 { sat = (sat - 100) * 3 + 100; } // HueAndSaturationAdjustment.OnSetRenderInfo

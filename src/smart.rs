@@ -193,6 +193,23 @@ pub fn draw(out: &mut [Px], w: usize, h: usize, src: &[Px], sw: usize, sh: usize
     use rayon::prelude::*;
     if let Some((ox, oy)) = xf.is_plain(sw, sh) {
         // exact copy, no resampling
+        if mask_out.is_none() {
+            // rows in parallel: only the rows and columns that land on the canvas
+            let (tx0, tx1) = (ox.max(0), (ox + sw as i64).min(w as i64));
+            if tx0 >= tx1 { return; }
+            out.par_chunks_mut(w).enumerate().for_each(|(ty, row)| {
+                let y = ty as i64 - oy;
+                if y < 0 || y >= sh as i64 { return; }
+                let srow = &src[y as usize * sw..(y as usize + 1) * sw];
+                for tx in tx0..tx1 {
+                    let p = srow[(tx - ox) as usize];
+                    if p[3] == 0 { continue; }
+                    let o = &mut row[tx as usize];
+                    *o = crate::doc::over(*o, p, 255);
+                }
+            });
+            return;
+        }
         let mut mask_out = mask_out;
         for y in 0..sh as i64 {
             let ty = y + oy;
@@ -360,6 +377,15 @@ pub fn drag(grip: Grip, xf0: &Xform, sw: usize, sh: usize, start: (f32, f32), no
                 let m = (sx.abs() / r0).max(sy.abs());
                 sx = sx.signum() * m * r0;
                 sy = sy.signum() * m;
+            } else if keep_aspect {
+                // an edge handle with Shift: the other side grows by the same factor, centred on the edge
+                if ax {
+                    let k = (sx / xf0.sx.abs().max(1e-6)).abs();
+                    sy = xf0.sy * k;
+                } else {
+                    let k = (sy / xf0.sy.abs().max(1e-6)).abs();
+                    sx = xf0.sx * k;
+                }
             }
             xf.sx = sx;
             xf.sy = sy;

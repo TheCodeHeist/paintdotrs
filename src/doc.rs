@@ -164,6 +164,11 @@ impl Layer {
     }
 }
 
+fn next_doc_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Everything undo needs to restore.
 #[derive(Clone)]
 pub struct State {
@@ -241,6 +246,8 @@ impl HistoryItem {
 pub const HISTORY_MEMORY_BUDGET: usize = 1536 * 1024 * 1024;
 
 pub struct Document {
+    /// unique for this run (names the autosave file)
+    pub id: u64,
     pub name: String,
     /// the layered project file (.pxe) this picture is saved as, if any
     pub path: Option<std::path::PathBuf>,
@@ -265,6 +272,7 @@ impl Document {
     pub fn new(name: &str, w: usize, h: usize, bg: Px) -> Self {
         let s = State { w, h, layers: vec![Layer::new("Background", w, h, bg)], active: 0, selection: None };
         let mut d = Document {
+            id: next_doc_id(),
             name: name.into(),
             path: None,
             source: None,
@@ -287,7 +295,7 @@ impl Document {
 
     pub fn from_layers(name: &str, w: usize, h: usize, layers: Vec<Layer>, first: &str) -> Self {
         let s = State { w, h, layers, active: 0, selection: None };
-        let mut d = Document { name: name.into(), path: None, source: None, s, history: vec![], hist_pos: 0, dirty: false, version: 1, sel_version: 1, zoom: 1.0, pan: (0.0, 0.0), fit_pending: true, damage: None, full_dirty: true, sel_bounds_cache: std::cell::Cell::new((0, None)) };
+        let mut d = Document { id: next_doc_id(), name: name.into(), path: None, source: None, s, history: vec![], hist_pos: 0, dirty: false, version: 1, sel_version: 1, zoom: 1.0, pan: (0.0, 0.0), fit_pending: true, damage: None, full_dirty: true, sel_bounds_cache: std::cell::Cell::new((0, None)) };
         d.history.push(HistoryItem::first(first, &d.s));
         d
     }
@@ -366,6 +374,16 @@ impl Document {
         self.hist_pos = self.history.len() - 1;
         self.dirty = true;
         self.touch();
+    }
+
+    /// Record a step whose pixels are already up to date on screen (they were marked as they changed), so
+    /// nothing has to be re-mixed: painting strokes, shapes, selections.
+    pub fn commit_quiet(&mut self, name: &str) {
+        let damage = self.damage;
+        let was_full = self.full_dirty;
+        self.commit(name);
+        self.full_dirty = was_full;
+        self.damage = damage;
     }
 
     pub fn goto(&mut self, i: usize) {

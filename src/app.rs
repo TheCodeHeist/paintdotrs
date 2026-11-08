@@ -13,6 +13,7 @@ use std::sync::mpsc;
 use crate::clip;
 
 mod freexf;
+mod selxf;
 
 pub const APP_NAME: &str = "Paint.RS";
 pub const DEFAULT_W: usize = 800;
@@ -42,6 +43,17 @@ pub const WHEEL_PIXELS_PER_NOTCH: f32 = 50.0;
 /// Number boxes move by the system's "lines per wheel notch" (3 by default) steps per notch, and ignore
 /// the wheel while Shift or Alt is held (PdnNumericSpin.OnMouseWheel, PaintDotNet.Framework.dll 0x0600077f).
 pub const NUMBER_STEPS_PER_NOTCH: f64 = 3.0;
+
+/// A quick fingerprint of pixels (invisible pixels count as empty), to recognise our own copy coming back
+/// through the system clipboard.
+pub fn fingerprint(px: &[Px]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for p in px {
+        let v = if p[3] == 0 { 0u32 } else { u32::from_le_bytes(*p) };
+        h = (h ^ v as u64).wrapping_mul(0x100000001b3);
+    }
+    h
+}
 
 /// Where a pasted picture goes, from the original's PasteImageAction.PerformActionImpl (paintdotnet.dll
 /// 0x060028f4): at the canvas corner if it fits in the visible part there; otherwise moved so it starts at
@@ -124,10 +136,18 @@ pub struct Opts {
     pub font_italic: bool,
     /// Magic Wand / Paint Bucket compare colours of the whole picture instead of the active layer
     pub sample_image: bool,
+    /// brush hardness 0..1 (original default 0.75)
+    pub hardness: f32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum PaintMode { Paint(Px), Erase, Clone((i32, i32)), Recolor(Px, Px) }
+
+/// The Clone Stamp source, as the original's CloneStampTool anchor modes (paintdotnet.dll
+/// OnUIDragBegin 0x06002155, UpdateAnchor 0x0600214e): a point chosen with Ctrl+click (mode 1) turns into a
+/// fixed offset at the first stroke (mode 2), so every later stroke copies with the same alignment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CloneSource { Anchor((f32, f32)), Offset((f32, f32)) }
 
 struct Drag {
     secondary: bool,
@@ -177,6 +197,8 @@ enum Dialog {
     /// the chosen file already exists
     Overwrite { path: PathBuf, export: bool },
     About,
+    /// pictures left in the autosave cache by a run that ended unexpectedly
+    Recover { items: Vec<crate::autosave::Found> },
 }
 
 #[derive(Clone, Copy)]
@@ -200,7 +222,10 @@ pub struct App {
     fx_last: f64,
     drag: Option<Drag>,
     text: Option<TextEdit>,
-    clone_anchor: Option<(f32, f32)>,
+    /// Clone Stamp source and the layer it copies from (the one active at Ctrl+click)
+    clone_anchor: Option<(CloneSource, usize)>,
+    /// that layer's pixels while a stroke copies from another layer
+    clone_px: Option<Vec<Px>>,
     clipboard: Option<(usize, usize, Vec<Px>)>,
     /// a copied selection outline (Edit > Copy Selection)
     sel_clipboard: Option<(usize, usize, Vec<u8>)>,
@@ -208,12 +233,30 @@ pub struct App {
     floating: Option<freexf::Floating>,
     /// a transform handle being dragged
     xdrag: Option<freexf::XDrag>,
+    /// the selection's own transform box (Move Selection tool)
+    selxf: Option<selxf::SelXf>,
+    /// where our last copy came from (x, y, w, h, fingerprint): pasting it again puts it back in the same place
+    copy_at: Option<(usize, usize, usize, usize, u64)>,
+    /// layer name for a picture being imported (dropped or Layers > Import)
+    paste_name: Option<String>,
+    seldrag: Option<freexf::XDrag>,
+    /// arrow presses gathered into one step
+    nudging: Option<selxf::Nudge>,
     dialog: Option<Dialog>,
     pixel_grid: bool,
     edit_secondary: bool,
     colors_more: bool,
+    /// which floating windows are open: tools, colours, history, layers (View menu, F5-F8)
+    panels: [bool; 4],
+    /// bumped by View > Reset Window Positions so the windows forget where they were dragged
+    panel_gen: u32,
+    /// a layer row being dragged to a new place in the list
+    layer_drag: Option<usize>,
+    autosaver: crate::autosave::Autosaver,
     /// search text in the font list
     font_filter: String,
+    /// rendered font previews: (family, weight, italic, dark) → texture
+    font_previews: Vec<((String, u16, bool, bool), egui::TextureHandle)>,
     hover: Option<(i32, i32)>,
     title: String,
     last_dir: PathBuf,
@@ -291,16 +334,38 @@ fn settings_path() -> Option<PathBuf> {
     Some(base.join("paint-rs").join("settings.txt"))
 }
 
-fn load_dark_setting() -> Option<bool> {
+fn load_setting(key: &str) -> Option<String> {
     let text = std::fs::read_to_string(settings_path()?).ok()?;
-    text.lines().find_map(|l| l.strip_prefix("dark=")).map(|v| v.trim() == "1")
+    let prefix = format!("{key}=");
+    text.lines().find_map(|l| l.strip_prefix(prefix.as_str())).map(|v| v.trim().to_string())
+}
+
+/// Remember one `key=value` setting, keeping the others.
+fn save_setting(key: &str, value: &str) {
+    let Some(p) = settings_path() else { return };
+    if let Some(dir) = p.parent() { let _ = std::fs::create_dir_all(dir); }
+    let prefix = format!("{key}=");
+    let old = std::fs::read_to_string(&p).unwrap_or_default();
+    let mut lines: Vec<String> = old.lines().filter(|l| !l.starts_with(prefix.as_str()) && !l.trim().is_empty()).map(String::from).collect();
+    lines.push(format!("{key}={value}"));
+    let _ = std::fs::write(p, lines.join("\n") + "\n");
+}
+
+fn load_dark_setting() -> Option<bool> {
+    load_setting("dark").map(|v| v == "1")
 }
 
 fn save_dark_setting(dark: bool) {
-    if let Some(p) = settings_path() {
-        if let Some(dir) = p.parent() { let _ = std::fs::create_dir_all(dir); }
-        let _ = std::fs::write(p, format!("dark={}\n", if dark { 1 } else { 0 }));
+    save_setting("dark", if dark { "1" } else { "0" });
+}
+
+/// Open floating windows (tools, colours, history, layers), all open the first time.
+fn load_panels() -> [bool; 4] {
+    let mut out = [true; 4];
+    if let Some(v) = load_setting("panels") {
+        for (i, c) in v.chars().take(4).enumerate() { out[i] = c != '0'; }
     }
+    out
 }
 
 fn c32(p: Px) -> Color32 { Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]) }
@@ -339,7 +404,7 @@ impl App {
             tool: Tool::Paintbrush,
             primary: [0, 0, 0, 255],
             secondary: [255, 255, 255, 255],
-            opts: Opts { brush: DEFAULT_BRUSH_SIZE, aa: true, fill: FillStyle::Outline, tol: DEFAULT_TOLERANCE, global: false, gradient: GradientKind::Linear, sel_mode: SelMode::Replace, radius: DEFAULT_RADIUS, font_size: DEFAULT_FONT_SIZE, font_family: None, font_weight: 400, font_italic: false, sample_image: false },
+            opts: Opts { brush: DEFAULT_BRUSH_SIZE, aa: true, fill: FillStyle::Outline, tol: DEFAULT_TOLERANCE, global: false, gradient: GradientKind::Linear, sel_mode: SelMode::Replace, radius: DEFAULT_RADIUS, font_size: DEFAULT_FONT_SIZE, font_family: None, font_weight: 400, font_italic: false, sample_image: false, hardness: crate::raster::BRUSH_HARDNESS },
             palette: default_palette(),
             tex: None,
             checker: None,
@@ -351,15 +416,26 @@ impl App {
             drag: None,
             text: None,
             clone_anchor: None,
+            clone_px: None,
             clipboard: None,
             sel_clipboard: None,
             floating: None,
             xdrag: None,
+            selxf: None,
+            copy_at: None,
+            paste_name: None,
+            seldrag: None,
+            nudging: None,
             dialog: None,
             pixel_grid: false,
             edit_secondary: false,
             colors_more: false,
+            panels: load_panels(),
+            panel_gen: 0,
+            layer_drag: None,
+            autosaver: crate::autosave::Autosaver::default(),
             font_filter: String::new(),
+            font_previews: Vec::new(),
             hover: None,
             title: String::new(),
             last_dir: std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/")),
@@ -384,6 +460,11 @@ impl App {
             app.docs.push(Document::new("Untitled", DEFAULT_W, DEFAULT_H, [255, 255, 255, 255]));
         }
         app.cur = app.docs.len() - 1;
+        // work left behind by a crash or power cut
+        if app.dialog.is_none() && app.shot.is_none() && std::env::var_os("PAINT_RS_SELFTEST").is_none() {
+            let found = crate::autosave::find_left_behind();
+            if !found.is_empty() { app.dialog = Some(Dialog::Recover { items: found }); }
+        }
         app
     }
 
@@ -423,6 +504,8 @@ impl App {
     fn apply_cov(&mut self, cov: &mut Coverage, snap: &[Px], mode: PaintMode) {
         let tol = raster::tolerance_byte(self.opts.tol);
         let Some((x0, y0, x1, y1)) = cov.take_recent() else { return };
+        // the Clone Stamp copies from its source layer (GetAnchorLayerIndex 0x0600215b)
+        let clone_from: &[Px] = match &self.clone_px { Some(p) if p.len() == snap.len() => p, _ => snap };
         let d = &mut self.docs[self.cur];
         let (w, h) = (d.w(), d.h());
         let crate::doc::State { selection, layers, active, .. } = &mut d.s;
@@ -441,7 +524,7 @@ impl App {
                     PaintMode::Erase => { let mut o = base; o[3] = (base[3] as u32 * (255 - c as u32) / 255) as u8; o }
                     PaintMode::Clone((ox, oy)) => {
                         let sx = x as i32 + ox; let sy = y as i32 + oy;
-                        if sx < 0 || sy < 0 || sx >= w as i32 || sy >= h as i32 { base } else { over(base, snap[sy as usize * w + sx as usize], c) }
+                        if sx < 0 || sy < 0 || sx >= w as i32 || sy >= h as i32 { base } else { over(base, clone_from[sy as usize * w + sx as usize], c) }
                     }
                     PaintMode::Recolor(to, from) => {
                         if raster::color_distance(base, from) <= tol { over(base, [to[0], to[1], to[2], base[3]], c) } else { base }
@@ -540,12 +623,24 @@ impl App {
         match tool {
             Tool::Paintbrush | Tool::Eraser | Tool::Pencil | Tool::CloneStamp | Tool::Recolor => {
                 if tool == Tool::CloneStamp {
-                    if mods.ctrl { self.clone_anchor = Some(pos); return; }
-                    let Some(an) = self.clone_anchor else {
-                        self.dialog = Some(Dialog::Message("Hold Ctrl and click first to choose where the Clone Stamp copies from.".into()));
+                    let layer = self.docs[self.cur].s.active;
+                    if mods.ctrl {
+                        // Ctrl+click (or Ctrl+drag) places the source on the active layer; no history step
+                        self.clone_anchor = Some((CloneSource::Anchor(pos), layer));
+                        self.drag = Some(drag);
                         return;
+                    }
+                    // without a source the original simply does nothing
+                    let Some((src, src_layer)) = self.clone_anchor else { return };
+                    let off = match src {
+                        CloneSource::Anchor(a) => (a.0 - pos.0, a.1 - pos.1),
+                        CloneSource::Offset(o) => o,
                     };
-                    drag.mode = Some(PaintMode::Clone(((an.0 - pos.0).round() as i32, (an.1 - pos.1).round() as i32)));
+                    self.clone_anchor = Some((CloneSource::Offset(off), src_layer));
+                    // copying from another layer: read that layer as it was when the stroke began
+                    let d = &self.docs[self.cur];
+                    self.clone_px = (src_layer != layer && src_layer < d.s.layers.len()).then(|| d.s.layers[src_layer].px.clone());
+                    drag.mode = Some(PaintMode::Clone((off.0.round() as i32, off.1.round() as i32)));
                 } else {
                     drag.mode = Some(match tool {
                         Tool::Eraser => PaintMode::Erase,
@@ -554,6 +649,7 @@ impl App {
                     });
                 }
                 let mut cov = Coverage::new(w, h);
+                cov.hardness = self.opts.hardness;
                 if tool == Tool::Pencil { let q = (pos.0.floor() as i32, pos.1.floor() as i32); cov.pixel_line(q, q); }
                 else { cov.dab(pos.0, pos.1, self.opts.brush, self.opts.aa); }
                 let snap = drag.snap.clone();
@@ -628,6 +724,9 @@ impl App {
                     }
                     self.apply_cov(&mut cov, &drag.snap, mode);
                     drag.cov = Some(cov);
+                } else if self.tool == Tool::CloneStamp && drag.mode.is_none() {
+                    // Ctrl+drag moves the source point (OnUIDragMove 0x06002156)
+                    if let Some((CloneSource::Anchor(_), l)) = self.clone_anchor { self.clone_anchor = Some((CloneSource::Anchor(pos), l)); }
                 }
             }
             Tool::Line => {
@@ -723,6 +822,7 @@ impl App {
 
     fn end_drag(&mut self) {
         let Some(drag) = self.drag.take() else { return };
+        self.clone_px = None;
         let name = match self.tool {
             Tool::RectSelect | Tool::EllipseSelect if !drag.moved => {
                 // a plain click deselects
@@ -732,6 +832,8 @@ impl App {
                 return;
             }
             Tool::Pan => return,
+            // placing the Clone Stamp source changes no pixels
+            Tool::CloneStamp if drag.mode.is_none() => return,
             Tool::MovePixels | Tool::MoveSelection if !drag.moved => return,
             Tool::LassoSelect if drag.lasso.len() < 3 => return,
             t => t.name(),
@@ -769,7 +871,8 @@ impl App {
             }
             _ => {}
         }
-        self.doc().commit(name);
+        // the pixels were redrawn on screen as they changed: only record the step
+        self.doc().commit_quiet(name);
     }
 
     fn finish_text(&mut self) {
@@ -917,6 +1020,7 @@ impl App {
         } }
         // also on the system clipboard, so it pastes into other pictures, other copies of the app and other programs
         self.sysclip.put(x1 - x0, y1 - y0, &out);
+        self.copy_at = Some((x0, y0, x1 - x0, y1 - y0, fingerprint(&out)));
         self.clipboard = Some((x1 - x0, y1 - y0, out));
     }
 
@@ -976,8 +1080,16 @@ impl App {
         }
         // The pasted picture floats with the transform handles on, keeping every pixel even where the canvas
         // hides it; it becomes ordinary pixels when deselected (parts past the canvas edge stay a smart object).
-        let (ox, oy) = paste_origin(pic.w, pic.h, self.visible_img);
-        self.float_picture(pic, if new_layer { "Paste into New Layer" } else { "Paste" }, (ox, oy), new_layer);
+        let name = self.paste_name.take();
+        // our own copy goes back exactly where it was copied from (e.g. onto another layer); anything else
+        // follows the original's placement rule
+        let (ox, oy) = match self.copy_at {
+            Some((x, y, w, h, f)) if name.is_none() && !expand && w == pic.w && h == pic.h && f == fingerprint(&pic.px) => (x, y),
+            _ => paste_origin(pic.w, pic.h, self.visible_img),
+        };
+        let label = if name.is_some() { "Import From File" } else if new_layer { "Paste into New Layer" } else { "Paste" };
+        let is_import = name.is_some();
+        self.float_picture(pic, label, (ox, oy), new_layer || is_import, name);
     }
 
     fn paste_new_image(&mut self) {
@@ -1199,12 +1311,10 @@ impl App {
     }
     fn import_layer(&mut self, path: &std::path::Path) -> Result<(), String> {
         // an imported picture floats on a new layer like a paste: nothing is cut off, even if it's bigger
+        // a picture bigger than the canvas asks first whether to expand the canvas, like a paste
         let (iw, ih, ipx) = io::load_pixels(path)?;
-        self.float_picture(clip::Picture { w: iw, h: ih, px: ipx }, "Import From File", (0, 0), true);
-        let name = io::file_name(path);
-        let d = self.doc();
-        let a = d.s.active;
-        d.s.layers[a].name = name;
+        self.paste_name = Some(io::file_name(path));
+        self.paste_picture(clip::Picture { w: iw, h: ih, px: ipx }, true);
         Ok(())
     }
 
@@ -1226,8 +1336,9 @@ impl App {
         let (prim, sec) = (self.primary, self.secondary);
         let d = self.doc();
         let (w, h) = (d.w(), d.h());
-        let out = effects::apply(fx, snap, w, h, vals, prim, sec);
         let sel = d.s.selection.clone();
+        // Auto-Level measures only the selected part, like the original
+        let out = if fx == Fx::AutoLevel { effects::auto_level(snap, sel.as_deref()) } else { effects::apply(fx, snap, w, h, vals, prim, sec) };
         let l = d.layer_mut();
         for i in 0..w * h {
             let m = sel.as_ref().map(|s| s[i]).unwrap_or(255);
@@ -1376,7 +1487,7 @@ impl App {
                         // undo/redo step through a floating picture's transforms first
                         (Key::Z, true, false) => self.undo(),
                         (Key::Y, true, _) | (Key::Z, true, true) => self.redo(),
-                        (Key::Enter, false, _) => self.finish_floating(),
+                        (Key::Enter, false, _) => { self.flush_nudge(true); if self.tool == Tool::MovePixels { self.deselect(); } else { self.finish_floating(); } }
                         (Key::A, true, false) => self.select_all(),
                         (Key::D, true, false) => self.deselect(),
                         (Key::I, true, false) => self.invert_selection(),
@@ -1407,8 +1518,26 @@ impl App {
                         (Key::X, false, false) => std::mem::swap(&mut self.primary, &mut self.secondary),
                         (Key::Escape, false, _) => {
                             if self.text.is_some() { self.finish_text(); }
+                            else if self.tool == Tool::MovePixels {
+                                // the original's Move tool: Escape during a drag cancels that drag
+                                // (TransformControl.OnKeyDown 0x060020e5); otherwise Enter and Escape both put
+                                // the pixels down and deselect (MoveTool.OnUIPreviewKeyDown 0x06001e9c)
+                                if let Some(x) = self.xdrag.take() { self.apply_xform(x.xf0); }
+                                else { self.flush_nudge(true); self.deselect(); }
+                            }
                             else if !self.cancel_floating() { self.deselect(); }
                         }
+                        // arrow keys nudge with the move tools: 1 pixel, 10 with Ctrl (ProcessArrowKey
+                        // 0x060020e6), else scroll
+                        (Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown, _, false) => {
+                            let step = if c { 10.0 } else { 1.0 };
+                            let (dx, dy) = match key { Key::ArrowLeft => (-step, 0.0), Key::ArrowRight => (step, 0.0), Key::ArrowUp => (0.0, -step), _ => (0.0, step) };
+                            self.nudge(dx, dy);
+                        }
+                        (Key::F5, false, false) => self.toggle_panel(0),
+                        (Key::F6, false, false) => self.toggle_panel(2),
+                        (Key::F7, false, false) => self.toggle_panel(3),
+                        (Key::F8, false, false) => self.toggle_panel(1),
                         (Key::OpenBracket, false, _) => self.opts.brush = (self.opts.brush - 1.0).max(1.0),
                         (Key::CloseBracket, false, _) => self.opts.brush = (self.opts.brush + 1.0).min(2000.0),
                         (k, false, false) => {
@@ -1427,7 +1556,12 @@ impl App {
         }
     }
 
+    fn tool_changed_since_nudge(&self) -> bool {
+        self.nudging.as_ref().map(|n| n.tool != self.tool || n.doc != self.cur).unwrap_or(false)
+    }
+
     fn set_tool(&mut self, t: Tool) {
+        self.flush_nudge(true);
         if self.tool == Tool::Text && t != Tool::Text { self.finish_text(); }
         if t != Tool::MovePixels { self.finish_floating(); }
         self.tool = t;
@@ -1442,6 +1576,11 @@ pub fn free_copy_name_for_tests(dir: &std::path::Path, stem: &str, ext: &str) ->
 // =====================================================================
 
 impl eframe::App for App {
+    /// A normal exit: unsaved work was confirmed, so the crash backups aren't needed.
+    fn on_exit(&mut self) {
+        self.autosaver.clear();
+    }
+
     /// Ctrl+C/X/V reach the app as keys (clipboard_shortcuts is off). While a text box has focus, turn them
     /// back into text copy/cut/paste so text editing works as usual.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
@@ -1499,7 +1638,7 @@ impl eframe::App for App {
                     let mut r = String::new();
                     let red = || clip::Picture { w: 100, h: 50, px: vec![[220, 30, 30, 255]; 100 * 50] };
                     // 1. paste fully inside, move it, put it down
-                    self.float_picture(red(), "Paste", (0, 0), false);
+                    self.float_picture(red(), "Paste", (0, 0), false, None);
                     r += &format!("handles after paste: {}\n", self.xform_target().is_some());
                     let mut xf = self.xform_target().unwrap().0;
                     xf.cx += 200.0; xf.cy += 100.0;
@@ -1508,7 +1647,7 @@ impl eframe::App for App {
                     let d = &self.docs[self.cur];
                     r += &format!("inside: layers={} pixel(250,125)={:?} smart={}\n", d.s.layers.len(), d.s.layers[0].px[125 * d.w() + 250], d.s.layers.iter().any(|l| l.smart.is_some()));
                     // 2. paste, push half of it past the left edge, put it down
-                    self.float_picture(red(), "Paste", (0, 0), false);
+                    self.float_picture(red(), "Paste", (0, 0), false, None);
                     let mut xf = self.xform_target().unwrap().0;
                     xf.cx -= 50.0; xf.angle = 0.3;
                     self.apply_xform(xf);
@@ -1531,7 +1670,7 @@ impl eframe::App for App {
                     self.doc().undo();
                     r += &format!("history steps={} undo ok={}\n", before, self.docs[self.cur].hist_pos + 1 == before);
                     // 5. while a paste floats, undo/redo step through its transforms; the paste stays
-                    self.float_picture(red(), "Paste", (0, 0), false);
+                    self.float_picture(red(), "Paste", (0, 0), false, None);
                     let start = self.xform_target().unwrap();
                     for dx in [100.0f32, 200.0] {
                         let (xf0, sw, sh) = self.xform_target().unwrap();
@@ -1552,7 +1691,87 @@ impl eframe::App for App {
                     self.undo();
                     self.undo();
                     let after_undo3 = cx(self);
-                    r += &format!("float steps: moved={after2:?} undo={after_undo1:?} undo={after_undo2:?} redo={after_redo:?} undo past paste={after_undo3:?} (expect 200, 100, 0, 100, None)\n");
+                    r += &format!("float steps: moved={after2:?} undo={after_undo1:?} undo={after_undo2:?} redo={after_redo:?} undo past paste={after_undo3:?} (every move is a history step now; undo lets go of the handles: expect 200 then None)\n");
+                    let _ = std::fs::write(out, r);
+                }
+                if self.frame > 15 { self.allow_quit = true; ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+            } else if let Some(out) = mode.strip_prefix("round2:") {
+                // tester round 2: selection free transform, nudge, paste in place, layer order
+                if self.frame == 10 {
+                    let mut r = String::new();
+                    let (w, h) = (self.docs[self.cur].w(), self.docs[self.cur].h());
+                    // a 100 x 50 selection at (100, 100)
+                    let mut m = vec![0u8; w * h];
+                    for y in 100..150 { for x in 100..200 { m[y * w + x] = 255; } }
+                    self.doc().s.selection = Some(m);
+                    self.doc().commit("Rectangle Select");
+                    self.tool = Tool::MoveSelection;
+                    let t = self.selxf_target();
+                    // drag the bottom-right corner 100 px right and 50 down: twice the size
+                    if let Some((xf0, sw, sh)) = t {
+                        self.seldrag = Some(freexf::XDrag { grip: crate::smart::Grip::Corner(2), start: (200.0, 150.0), xf0, sw, sh });
+                        self.selxf_update((300.0, 200.0), false);
+                        self.selxf_release();
+                    }
+                    r += &format!("selection after resize: {:?} (expect (100, 100, 300, 200))\n", self.docs[self.cur].sel_bounds());
+                    let _ = std::fs::write(out, &r);
+                    self.nudge(1.0, 0.0);
+                    self.nudge(0.0, 10.0); // Ctrl-sized step
+                    self.flush_nudge(true);
+                    r += &format!("after nudge right 1 and down 10: {:?} (expect (101, 110, 301, 210))\n", self.docs[self.cur].sel_bounds());
+                    // copy a red block on the background, paste it into a new layer: it lands in the same place
+                    self.tool = Tool::RectSelect;
+                    let mut m = vec![0u8; w * h];
+                    for y in 40..60 { for x in 300..340 { m[y * w + x] = 255; self.doc().s.layers[0].px[y * w + x] = [200, 0, 0, 255]; } }
+                    self.doc().s.selection = Some(m);
+                    self.doc().commit("Rectangle Select");
+                    self.copy(false);
+                    let _ = std::fs::write(out, format!("{r}copied\n"));
+                    self.add_layer(true);
+                    let _ = std::fs::write(out, format!("{r}copied, layer added\n"));
+                    let offer = match self.sysclip.offer() { clip::Offer::Picture(p) => format!("picture {}x{}", p.w, p.h), clip::Offer::Link(l) => l, clip::Offer::Nothing => "nothing".into() };
+                    let _ = std::fs::write(out, format!("{r}copied, layer added, offer {offer}\n"));
+                    self.paste(false);
+                    r += &format!("paste in place: {:?} (expect Some(300.0, 40.0))\n", self.xform_target().map(|(xf, sw, sh)| (xf.cx - sw as f32 / 2.0, xf.cy - sh as f32 / 2.0)));
+                    r += &format!("paste is in history right away: {:?}\n", self.docs[self.cur].history.last().map(|h| h.name.clone()));
+                    // move it: a step at once, no Enter needed; undo takes back only the move
+                    let (xf0, sw, sh) = self.xform_target().unwrap();
+                    self.xdrag = Some(freexf::XDrag { grip: crate::smart::Grip::Move, start: (0.0, 0.0), xf0, sw, sh });
+                    let mut moved = xf0; moved.cx += 50.0;
+                    self.apply_xform(moved);
+                    self.xform_release();
+                    let at = |s: &Self, x: usize, y: usize| { let d = &s.docs[s.cur]; d.layer().px[y * d.w() + x] };
+                    r += &format!("after move: last step {:?}, pixel at new place {:?}\n", self.docs[self.cur].history.last().map(|h| h.name.clone()), at(self, 355, 45));
+                    self.undo();
+                    r += &format!("undo move: pixel back {:?}, moved spot {:?}, step {:?}\n", at(self, 305, 45), at(self, 355, 45), self.docs[self.cur].history[self.docs[self.cur].hist_pos].name);
+                    self.undo();
+                    r += &format!("undo paste: pixel {:?} (expect empty)\n", at(self, 305, 45));
+                    // clone stamp: every stroke is one step, undo takes it back exactly
+                    self.set_tool(Tool::CloneStamp);
+                    self.doc().s.active = 0;
+                    self.doc().s.selection = None;
+                    self.doc().commit("Deselect");
+                    let n0 = self.docs[self.cur].history.len();
+                    let before = self.docs[self.cur].layer().px.clone();
+                    self.begin_drag((320.0, 50.0), false, egui::Modifiers { ctrl: true, ..Default::default() });
+                    self.end_drag();
+                    for stroke in 0..2 {
+                        let y = 200.0 + stroke as f32 * 40.0;
+                        self.begin_drag((100.0, y), false, egui::Modifiers::default());
+                        self.update_drag((130.0, y), egui::Modifiers::default());
+                        self.end_drag();
+                    }
+                    let d = &self.docs[self.cur];
+                    r += &format!("clone: steps added {} (expect 2), names {:?}, cloned pixel {:?}\n", d.history.len() - n0, d.history.iter().skip(n0).map(|h| h.name.clone()).collect::<Vec<_>>(), d.layer().px[200 * d.w() + 110]);
+                    self.undo();
+                    self.undo();
+                    r += &format!("clone undone exactly: {}\n", self.docs[self.cur].layer().px == before);
+                    self.redo();
+                    r += &format!("redo one stroke: changed {}\n", self.docs[self.cur].layer().px != before);
+                    self.finish_floating();
+                    let names: Vec<String> = self.docs[self.cur].s.layers.iter().map(|l| l.name.clone()).collect();
+                    r += &format!("layers: {names:?}\n");
+                    r += &format!("history: {:?}\n", self.docs[self.cur].history.iter().map(|h| h.name.clone()).collect::<Vec<_>>());
                     let _ = std::fs::write(out, r);
                 }
                 if self.frame > 15 { self.allow_quit = true; ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
@@ -1590,6 +1809,10 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
+        // a run of arrow presses becomes one history step after a pause
+        if self.nudging.is_some() { self.flush_nudge(self.tool_changed_since_nudge()); ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
+        // back up unsaved pictures now and then, for recovery after a crash
+        self.autosaver.tick(&self.docs);
         // closing with unsaved work
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_quit {
             if let Some(i) = self.docs.iter().position(|d| d.dirty) {
@@ -1633,23 +1856,76 @@ impl eframe::App for App {
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("toolbar").show(ui, |ui| self.tool_bar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
-        egui::Panel::left("tools").resizable(false).exact_size(80.0).show(ui, |ui| self.tools_panel(ui));
-        egui::Panel::right("side").resizable(true).default_size(250.0).min_size(200.0).show(ui, |ui| {
-            self.history_panel(ui);
-            ui.separator();
-            self.layers_panel(ui);
-        });
         egui::CentralPanel::default().frame(egui::Frame::new().fill(self.theme().canvas_bg)).show(ui, |ui| {
             self.tabs(ui);
             self.canvas(ui);
         });
+        self.panel_windows(&ctx);
         self.dialogs(&ctx);
         self.text_box(&ctx);
         self.color_window(&ctx);
     }
 }
 
+pub const PANEL_NAMES: [&str; 4] = ["Tools", "Colors", "History", "Layers"];
+/// The original's View menu keys for its floating windows: Tools F5, History F6, Layers F7, Colors F8.
+pub const PANEL_KEYS: [&str; 4] = ["F5", "F8", "F6", "F7"];
+
 impl App {
+    /// Tools, colours, history and layers as floating windows: drag them anywhere, close them, and bring them
+    /// back from the View menu.
+    fn panel_windows(&mut self, ctx: &egui::Context) {
+        let area = ctx.content_rect();
+        let top = area.top() + 72.0;
+        let before = self.panels;
+        let generation = self.panel_gen;
+        // no big title bar: a slim header with the name in small print and a close button; the window is
+        // dragged by its header or any empty part of it
+        let mk = |i: usize| egui::Window::new(PANEL_NAMES[i]).id(egui::Id::unique(("panel", i, generation)))
+            .title_bar(false).collapsible(false).frame(egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::same(5)));
+        let header = |ui: &mut egui::Ui, i: usize, close: &mut bool| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.label(egui::RichText::new(PANEL_NAMES[i]).size(10.0).weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let b = egui::Button::new(egui::RichText::new("×").size(10.0)).frame(false).min_size(vec2(12.0, 12.0));
+                    if ui.add(b).on_hover_text(format!("Close (bring it back from View, {})", PANEL_KEYS[i])).clicked() { *close = true; }
+                });
+            });
+            ui.add_space(-2.0);
+        };
+        let mut close = [false; 4];
+        if self.panels[0] {
+            mk(0).resizable(true).default_size(vec2(76.0, 396.0)).min_size(vec2(30.0, 60.0)).default_pos(pos2(area.left() + 8.0, top))
+                .show(ctx, |ui| { header(ui, 0, &mut close[0]); self.tools_panel(ui) });
+        }
+        if self.panels[1] {
+            mk(1).resizable(true).default_size(vec2(66.0, 306.0)).min_width(70.0).min_height(60.0)
+                .pivot(egui::Align2::LEFT_BOTTOM).default_pos(pos2(area.left() + 92.0, area.bottom() - 30.0))
+                .show(ctx, |ui| { header(ui, 1, &mut close[1]); self.colors_panel(ui) });
+        }
+        if self.panels[2] {
+            mk(2).resizable(true).default_size(vec2(230.0, 220.0)).min_width(180.0)
+                .default_pos(pos2(area.right() - 246.0, top)).show(ctx, |ui| { header(ui, 2, &mut close[2]); self.history_panel(ui) });
+        }
+        if self.panels[3] {
+            mk(3).resizable(true).default_size(vec2(230.0, 280.0)).min_width(180.0)
+                .default_pos(pos2(area.right() - 246.0, top + 250.0)).show(ctx, |ui| { header(ui, 3, &mut close[3]); self.layers_panel(ui) });
+        }
+        for i in 0..4 { if close[i] { self.panels[i] = false; } }
+        if self.panels != before { self.save_panels(); }
+    }
+
+    fn save_panels(&self) {
+        let v: String = self.panels.iter().map(|b| if *b { '1' } else { '0' }).collect();
+        save_setting("panels", &v);
+    }
+
+    fn toggle_panel(&mut self, i: usize) {
+        self.panels[i] = !self.panels[i];
+        self.save_panels();
+    }
+
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
             let has_sel = self.docs[self.cur].s.selection.is_some();
@@ -1695,6 +1971,13 @@ impl App {
                 if ui.button("Actual Size         Ctrl+0").clicked() { self.actual_size(); ui.close(); }
                 ui.separator();
                 ui.checkbox(&mut self.pixel_grid, "Pixel grid");
+                ui.separator();
+                for i in [0usize, 2, 3, 1] {
+                    let mut on = self.panels[i];
+                    if ui.checkbox(&mut on, format!("{:<20}{}", PANEL_NAMES[i], PANEL_KEYS[i])).changed() { self.toggle_panel(i); }
+                }
+                if ui.button("Reset Window Positions").clicked() { self.panels = [true; 4]; self.panel_gen += 1; self.save_panels(); ui.close(); }
+                ui.separator();
                 let mut dark = self.dark;
                 if ui.checkbox(&mut dark, "Dark mode          Ctrl+Shift+L").changed() { let c = ui.ctx().clone(); self.set_dark(&c, dark); }
             });
@@ -1766,6 +2049,30 @@ impl App {
         cat.data(face.id)
     }
 
+    /// A small "Lorem ipsum" sample of a font family in the current weight, drawn with the same text renderer
+    /// the Text tool uses, so what you see is what you get.
+    fn font_preview(&mut self, ctx: &egui::Context, family: &str) -> Option<egui::TextureHandle> {
+        let key = (family.to_string(), self.opts.font_weight, self.opts.font_italic, self.dark);
+        if let Some((_, t)) = self.font_previews.iter().find(|(k, _)| *k == key) { return Some(t.clone()); }
+        let cat = crate::fonts::catalog()?;
+        let face = cat.pick(family, self.opts.font_weight, self.opts.font_italic)?;
+        let (data, index) = cat.data(face.id)?;
+        let (w, h) = (300usize, 64usize);
+        let cov = crate::raster::text_coverage(w, h, "Lorem ipsum dolor sit\nAaBbCc 0123456789", 22.0, 6.0, 4.0, Some((&data, index)));
+        let ink = if self.dark { [235u8, 235, 235] } else { [20u8, 20, 20] };
+        let mut rgba = vec![0u8; w * h * 4];
+        for y in 0..h { for x in 0..w {
+            let i = (y * w + x) * 4;
+            rgba[i..i + 3].copy_from_slice(&ink);
+            rgba[i + 3] = cov.get(x, y);
+        } }
+        let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+        let tex = ctx.load_texture(format!("font-preview-{}", self.font_previews.len()), img, egui::TextureOptions::LINEAR);
+        if self.font_previews.len() >= 64 { let _ = self.font_previews.remove(0); }
+        self.font_previews.push((key, tex.clone()));
+        Some(tex)
+    }
+
     /// Font family, weight and italic pickers for the Text tool.
     fn font_controls(&mut self, ui: &mut egui::Ui) {
         let Some(cat) = crate::fonts::catalog() else {
@@ -1777,16 +2084,38 @@ impl App {
         }
         let current = self.opts.font_family.clone().unwrap_or_default();
         ui.label("Font:");
-        egui::ComboBox::from_id_salt("font-family").selected_text(&current).width(170.0).height(320.0).show_ui(ui, |ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.font_filter).hint_text("Search fonts").desired_width(160.0));
-            let f = self.font_filter.to_lowercase();
-            for (name, _) in cat.families.iter().filter(|(n, _)| f.is_empty() || n.to_lowercase().contains(&f)) {
-                if ui.selectable_label(*name == current, name).clicked() {
-                    self.opts.font_family = Some(name.clone());
-                    ui.close();
-                }
+        let mut hovered: Option<String> = None;
+        let combo = egui::ComboBox::from_id_salt("font-family").selected_text(&current).width(170.0).height(320.0)
+            // clicking the search box must not close the list
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show_ui(ui, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.font_filter).hint_text("Search fonts").desired_width(160.0));
+                let f = self.font_filter.to_lowercase();
+                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    for (name, _) in cat.families.iter().filter(|(n, _)| f.is_empty() || n.to_lowercase().contains(&f)) {
+                        let r = ui.selectable_label(*name == current, name);
+                        if r.hovered() { hovered = Some(name.clone()); }
+                        if r.clicked() {
+                            self.opts.font_family = Some(name.clone());
+                            ui.close();
+                        }
+                    }
+                });
+            });
+        // preview of the hovered font (or the chosen one) beside the list
+        let open = combo.inner.is_some();
+        let fam = hovered.unwrap_or_else(|| current.clone());
+        if let Some(tex) = self.font_preview(ui.ctx(), &fam) {
+            let show = |ui: &mut egui::Ui| { ui.add(egui::Image::new(&tex).fit_to_original_size(1.0)); };
+            if open {
+                let at = combo.response.rect.right_bottom() + vec2(190.0, 4.0);
+                egui::Area::new(egui::Id::unique("font-preview")).order(egui::Order::Tooltip).fixed_pos(at).show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| { ui.small(&fam); show(ui); });
+                });
+            } else {
+                combo.response.on_hover_ui(|ui| show(ui));
             }
-        });
+        }
         if let Some(faces) = cat.faces(&current) {
             let chosen = cat.pick(&current, self.opts.font_weight, self.opts.font_italic);
             let label = |f: &crate::fonts::Face| format!("{}{}", crate::fonts::weight_name(f.weight), if f.italic { " Italic" } else { "" });
@@ -1811,6 +2140,11 @@ impl App {
             if t.uses_brush_width() {
                 ui.label("Brush width:");
                 num_box(ui, &mut self.opts.brush, 1.0..=2000.0, 1.0, "");
+            }
+            if matches!(t, Tool::Paintbrush | Tool::Eraser | Tool::CloneStamp | Tool::Recolor) {
+                ui.label("Hardness:");
+                let mut pct = (self.opts.hardness * 100.0).round();
+                if ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%")).on_hover_text("How much of the brush is solid before its edge fades (needs Antialiasing)").changed() { self.opts.hardness = pct / 100.0; }
             }
             if t.is_shape() {
                 ui.label("Draw:");
@@ -1865,7 +2199,11 @@ impl App {
                 num_box(ui, &mut self.opts.font_size, 1.0..=2000.0, 1.0, " pt");
             }
             if t == Tool::CloneStamp {
-                ui.label(match self.clone_anchor { Some(a) => format!("Copying from {}, {}", a.0 as i32, a.1 as i32), None => "Ctrl+click to choose a source".into() });
+                ui.label(match self.clone_anchor {
+                    Some((CloneSource::Anchor(a), _)) => format!("Copying from {}, {} (Ctrl+click to move it)", a.0 as i32, a.1 as i32),
+                    Some((CloneSource::Offset(o), _)) => format!("Copying from {} , {} away, aligned (Ctrl+click for a new source)", o.0.round() as i32, o.1.round() as i32),
+                    None => "Ctrl+click to choose a source".into(),
+                });
             }
         });
     }
@@ -1888,8 +2226,9 @@ impl App {
     }
 
     fn tools_panel(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new("Tools").small().strong());
+        // as many columns as fit the window's width (two by default), scrolling when it's made short
+        let cols = (((ui.available_width() + 4.0) / 34.0).floor() as usize).max(1);
+        egui::ScrollArea::vertical().id_salt("tools-scroll").auto_shrink([false, false]).show(ui, |ui| {
         egui::Grid::new("toolgrid").spacing(vec2(4.0, 4.0)).min_col_width(30.0).show(ui, |ui| {
             for (i, t) in Tool::ALL.iter().enumerate() {
                 let (r, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
@@ -1901,16 +2240,13 @@ impl App {
                 tools::icon(ui.painter(), r.shrink(4.0), *t, th.icon);
                 if resp.clicked() { self.set_tool(*t); }
                 resp.on_hover_text(format!("{} ({})", t.name(), t.key()));
-                if i % 2 == 1 { ui.end_row(); }
+                if i % cols == cols - 1 { ui.end_row(); }
             }
         });
-        ui.add_space(8.0);
-        ui.separator();
-        self.colors_panel(ui);
+        });
     }
 
     fn colors_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("Colors").small().strong());
         let (r, _) = ui.allocate_exact_size(vec2(64.0, 54.0), Sense::hover());
         let sec_r = Rect::from_min_size(r.min + vec2(24.0, 22.0), vec2(30.0, 30.0));
         let pri_r = Rect::from_min_size(r.min + vec2(4.0, 2.0), vec2(30.0, 30.0));
@@ -1932,16 +2268,22 @@ impl App {
         });
         if ui.small_button(if self.colors_more { "Less «" } else { "More »" }).clicked() { self.colors_more = !self.colors_more; }
         ui.add_space(4.0);
+        let pcols = (((ui.available_width() + 1.0) / 16.0).floor() as usize).max(4);
+        egui::ScrollArea::vertical().id_salt("palette-scroll").auto_shrink([false, false]).show(ui, |ui| {
         egui::Grid::new("palette").spacing(vec2(1.0, 1.0)).min_col_width(15.0).show(ui, |ui| {
             let pal = self.palette.clone();
             for (i, c) in pal.iter().enumerate() {
                 let (r, resp) = ui.allocate_exact_size(vec2(15.0, 12.0), Sense::click());
                 ui.painter().rect_filled(r, 0.0, c32(*c));
+                // contrasting outline so dark colours show on a dark theme and light ones on a light theme
+                let edge = if self.dark { Color32::WHITE } else { Color32::BLACK };
+                ui.painter().rect_stroke(r, 0.0, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
                 if resp.clicked() { self.primary = *c; }
                 if resp.secondary_clicked() { self.secondary = *c; }
                 resp.on_hover_text("Left click: primary, right click: secondary");
-                if i % 4 == 3 { ui.end_row(); }
+                if i % pcols == pcols - 1 { ui.end_row(); }
             }
+        });
         });
     }
 
@@ -1983,7 +2325,6 @@ impl App {
         };
         let mut action = 0;
         ui.horizontal(|ui| {
-            ui.strong("History");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add_enabled(can_redo, egui::Button::new("⏭").small()).on_hover_text("Redo all").clicked() { action = 4; }
                 if ui.add_enabled(can_redo, egui::Button::new("↷").small()).on_hover_text("Redo (Ctrl+Y)").clicked() { action = 3; }
@@ -1993,7 +2334,7 @@ impl App {
         });
         let mut jump = None;
         let mut float_jump = None;
-        egui::ScrollArea::vertical().id_salt("hist").max_height(180.0).stick_to_bottom(true).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("hist").max_height((ui.available_height() - 4.0).max(60.0)).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             let muted = self.theme().muted;
             let icon_col = self.theme().icon;
@@ -2020,22 +2361,21 @@ impl App {
             }
         });
         match action {
-            1 => { if floating.is_some() { self.floating_goto(0); self.undo(); } self.finish_floating(); self.doc().goto(0); }
+            1 => { self.release_floating(); self.doc().goto(0); }
             2 => self.undo(),
             3 => self.redo(),
-            4 => { if let Some((n, _)) = &floating { self.floating_goto(n.len() - 1); } else { let d = self.doc(); let n = d.history.len() - 1; d.goto(n); } }
+            4 => { self.release_floating(); let d = self.doc(); let n = d.history.len() - 1; d.goto(n); }
             _ => {}
         }
         if let Some(i) = float_jump { self.floating_goto(i); }
         if let Some(i) = jump {
-            // jumping back past a floating picture takes it away first
-            self.cancel_floating();
+            // the handles go; every step is already in the history
+            self.release_floating();
             self.doc().goto(i);
         }
     }
 
     fn layers_panel(&mut self, ui: &mut egui::Ui) {
-        ui.strong("Layers");
         let key = (self.cur, self.docs[self.cur].version);
         if self.thumbs_key != key && self.drag.is_none() {
             self.thumbs_key = key;
@@ -2055,14 +2395,21 @@ impl App {
             }).collect();
         }
         let mut action: Option<(usize, u8)> = None;
-        egui::ScrollArea::vertical().id_salt("layers").max_height((ui.available_height() - 40.0).max(80.0)).show(ui, |ui| {
+        let mut rows: Vec<(usize, Rect)> = Vec::new();
+        let mut drag_started: Option<usize> = None;
+        let dragging = self.layer_drag;
+        egui::ScrollArea::vertical().id_salt("layers").max_height((ui.available_height() - 34.0).max(80.0)).auto_shrink([false, false]).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             let th = self.theme();
             let d = &self.docs[self.cur];
             for i in (0..d.s.layers.len()).rev() {
                 let l = &d.s.layers[i];
                 let active = i == d.s.active;
-                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::click());
+                // rows can be dragged up and down to change the layer order
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::click_and_drag());
+                rows.push((i, r));
+                if resp.drag_started() { drag_started = Some(i); }
+                if dragging == Some(i) { ui.painter().rect_stroke(r, 3.0, Stroke::new(1.0, th.accent), egui::StrokeKind::Inside); }
                 if active { ui.painter().rect_filled(r, 3.0, th.sel_bg); } else if resp.hovered() { ui.painter().rect_filled(r, 3.0, th.hover_bg); }
                 if let Some((_, t)) = self.thumbs.get(i) {
                     let tr = Rect::from_center_size(pos2(r.left() + 26.0, r.center().y), t.size_vec2());
@@ -2084,6 +2431,49 @@ impl App {
                 else if resp.clicked() { action = Some((i, 2)); }
             }
         });
+        if let Some(i) = drag_started { self.layer_drag = Some(i); }
+        if let Some(from) = self.layer_drag {
+            // where it would land: before or after the row under the pointer
+            let pointer = ui.ctx().pointer_latest_pos();
+            let mut target = None;
+            if let Some(p) = pointer {
+                for (i, r) in &rows {
+                    if p.y >= r.top() && p.y < r.bottom() {
+                        // rows are listed top layer first: the upper half means "above this layer"
+                        target = Some(if p.y < r.center().y { (*i, true) } else { (*i, false) });
+                    }
+                }
+                if target.is_none() {
+                    if let (Some(first), Some(last)) = (rows.first(), rows.last()) {
+                        if p.y < first.1.top() { target = Some((first.0, true)); } else if p.y >= last.1.bottom() { target = Some((last.0, false)); }
+                    }
+                }
+            }
+            if let Some((i, above)) = target {
+                if let Some((_, r)) = rows.iter().find(|(j, _)| *j == i) {
+                    let y = if above { r.top() } else { r.bottom() };
+                    ui.painter().hline(r.x_range(), y, Stroke::new(2.0, self.theme().accent));
+                }
+            }
+            if !ui.ctx().input(|inp| inp.pointer.primary_down()) {
+                self.layer_drag = None;
+                if let Some((i, above)) = target {
+                    // index the layer ends up at
+                    let mut to = if above { i + 1 } else { i };
+                    if from < to { to -= 1; }
+                    if to != from {
+                        self.finish_floating();
+                        let d = self.doc();
+                        let l = d.s.layers.remove(from);
+                        d.s.layers.insert(to, l);
+                        d.s.active = to;
+                        d.commit("Move Layer");
+                    }
+                }
+            } else {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+        }
         match action {
             Some((i, 0)) => { self.finish_floating(); let d = self.doc(); d.s.layers[i].visible = !d.s.layers[i].visible; d.commit("Layer Visibility"); }
             Some((i, 1)) => { self.finish_floating(); self.doc().s.active = i; self.open_layer_props(); }
@@ -2227,7 +2617,7 @@ impl App {
             _ => Vec2::ZERO,
         };
         let selecting = matches!((&self.drag, self.tool), (Some(_), Tool::RectSelect | Tool::EllipseSelect | Tool::LassoSelect));
-        if !self.outline.2.is_empty() && !(selecting && self.opts.sel_mode == SelMode::Replace) {
+        if !self.outline.2.is_empty() && !(selecting && self.opts.sel_mode == SelMode::Replace) && !self.selxf_dragging() {
             // only the edges that are on screen, with dashes and animation only when that stays cheap
             let view = avail.expand(2.0);
             let visible: Vec<(Pos2, Pos2)> = self.outline.2.iter()
@@ -2282,8 +2672,17 @@ impl App {
             if matches!(self.tool, Tool::Paintbrush | Tool::Eraser | Tool::CloneStamp | Tool::Recolor) {
                 painter.circle_stroke(p, (self.opts.brush * z / 2.0).max(1.5), Stroke::new(1.0, Color32::from_black_alpha(150)));
             }
-            if let (Tool::CloneStamp, Some(a)) = (self.tool, self.clone_anchor) {
-                painter.circle_stroke(to_scr(a.0, a.1), 6.0, Stroke::new(1.0, Color32::from_rgb(220, 40, 40)));
+            if let (Tool::CloneStamp, Some((src, _))) = (self.tool, self.clone_anchor) {
+                // the source marker: the chosen point, or the brush position plus the fixed offset; its
+                // size is the brush's (AnchorRadius = brush width / 2, UpdateAnchor 0x0600214e)
+                let at = match src {
+                    CloneSource::Anchor(a) => to_scr(a.0, a.1),
+                    CloneSource::Offset(o) => p + vec2(o.0, o.1) * z,
+                };
+                let r = (self.opts.brush * z / 2.0).max(4.0);
+                painter.circle_stroke(at, r, Stroke::new(1.0, Color32::from_rgb(220, 40, 40)));
+                painter.line_segment([at - vec2(3.0, 0.0), at + vec2(3.0, 0.0)], Stroke::new(1.0, Color32::from_rgb(220, 40, 40)));
+                painter.line_segment([at - vec2(0.0, 3.0), at + vec2(0.0, 3.0)], Stroke::new(1.0, Color32::from_rgb(220, 40, 40)));
             }
         }
 
@@ -2336,6 +2735,7 @@ impl App {
         if self.tool == Tool::MovePixels {
             if (pressed_p || pressed_s) && resp.hovered() && self.xdrag.is_none() && self.dialog.is_none() {
                 if let Some(p) = hover_pos {
+                    self.flush_nudge(true);
                     self.xform_press((p.x, p.y), to_img(p), pressed_s, &scr);
                 }
             } else if self.xdrag.is_some() {
@@ -2346,6 +2746,21 @@ impl App {
             self.draw_xform_box(&painter, &scr);
             if resp.hovered() {
                 if let Some(p) = hover_pos { ctx.set_cursor_icon(self.xform_cursor((p.x, p.y), &scr)); }
+            }
+            return;
+        }
+        // Move Selection: the selection outline gets the same free transform handles
+        if self.tool == Tool::MoveSelection {
+            if (pressed_p || pressed_s) && resp.hovered() && self.seldrag.is_none() && self.dialog.is_none() {
+                if let Some(p) = hover_pos { self.flush_nudge(true); self.selxf_press((p.x, p.y), to_img(p), pressed_s, &scr); }
+            } else if self.seldrag.is_some() {
+                if let Some(p) = pointer.latest_pos() { self.selxf_update(to_img(p), mods.shift); }
+                if !(pointer.primary_down() || pointer.secondary_down()) { self.selxf_release(); }
+                ctx.request_repaint();
+            }
+            self.draw_selxf(&painter, &scr);
+            if resp.hovered() {
+                if let Some(p) = hover_pos { let c = self.selxf_cursor((p.x, p.y), &scr); ctx.set_cursor_icon(c); }
             }
             return;
         }
@@ -2424,7 +2839,9 @@ impl App {
     fn dialogs(&mut self, ctx: &egui::Context) {
         let Some(mut dlg) = self.dialog.take() else { return };
         let mut keep = true;
-        let win = |title: &str| egui::Window::new(title.to_string()).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).order(egui::Order::Foreground);
+        // dialogs open in the middle and can be dragged anywhere by their title bar (to see the picture behind)
+        let mid = ctx.content_rect().center();
+        let win = |title: &str| egui::Window::new(title.to_string()).collapsible(false).resizable(false).pivot(egui::Align2::CENTER_CENTER).default_pos(mid).movable(true).order(egui::Order::Foreground);
         match &mut dlg {
             Dialog::Message(m) => {
                 win("Notice").show(ctx, |ui| { ui.label(m.as_str()); if ui.button("OK").clicked() { keep = false; } });
@@ -2437,18 +2854,56 @@ impl App {
                     if ui.button("OK").clicked() { keep = false; }
                 });
             }
+            Dialog::Recover { items } => {
+                let mut choice = 0;
+                win("Recover unsaved work").show(ctx, |ui| {
+                    ui.label("Paint.RS didn't close normally last time. These pictures had changes that weren't saved:");
+                    for f in items.iter() {
+                        let age = if f.age_secs < 120 { format!("{} seconds ago", f.age_secs) } else if f.age_secs < 7200 { format!("{} minutes ago", f.age_secs / 60) } else { format!("{} hours ago", f.age_secs / 3600) };
+                        ui.label(format!("• {} (backed up {age})", f.name));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Recover").clicked() { choice = 1; }
+                        if ui.button("Discard").on_hover_text("Delete these backups").clicked() { choice = 2; }
+                        if ui.button("Later").on_hover_text("Keep the backups and ask again next time").clicked() { choice = 3; }
+                    });
+                });
+                if choice != 0 {
+                    keep = false;
+                    let items = items.clone();
+                    if choice == 1 {
+                        let mut errors = vec![];
+                        for f in &items {
+                            match crate::autosave::recover(f) {
+                                Ok(d) => { self.docs.push(d); self.cur = self.docs.len() - 1; crate::autosave::forget(f); }
+                                Err(e) => errors.push(format!("{}: {e}", f.name)),
+                            }
+                        }
+                        // drop the blank picture made at start-up
+                        if self.docs.len() > 1 && self.docs[0].path.is_none() && !self.docs[0].dirty && self.docs[0].hist_pos == 0 && self.docs[0].source.is_none() {
+                            self.docs.remove(0);
+                            self.cur = self.docs.len() - 1;
+                        }
+                        if !errors.is_empty() { dlg = Dialog::Message(format!("Couldn't recover: {}", errors.join(", "))); keep = true; }
+                    } else if choice == 2 {
+                        for f in &items { crate::autosave::forget(f); }
+                    }
+                }
+            }
             Dialog::PasteBig { pic, new_layer } => {
                 let (pw, ph, nl) = (pic.w, pic.h, *new_layer);
                 let (cw, ch) = (self.docs[self.cur].w(), self.docs[self.cur].h());
                 let mut choice = 0;
+                let what = if self.paste_name.is_some() { "adding" } else { "pasting" };
                 win("Paste a bigger picture").show(ctx, |ui| {
-                    ui.label(format!("The picture you're pasting is {pw} × {ph}, bigger than the canvas ({cw} × {ch})."));
+                    ui.label(format!("The picture you're {what} is {pw} × {ph}, bigger than the canvas ({cw} × {ch})."));
                     ui.horizontal(|ui| {
                         if ui.button("Expand canvas").clicked() { choice = 1; }
                         if ui.button("Keep canvas size").clicked() { choice = 2; }
                         if ui.button("Cancel").clicked() { choice = 3; }
                     });
                 });
+                if choice == 3 { self.paste_name = None; }
                 if choice != 0 {
                     keep = false;
                     if choice < 3 {
@@ -2724,7 +3179,7 @@ impl App {
         let title = match mode { FileMode::Open => "Open", FileMode::Save => "Save Project (.pxe)", FileMode::Export => "Export a Copy", FileMode::ImportLayer => "Import From File" };
         let is_save = matches!(mode, FileMode::Save | FileMode::Export);
         let is_export = matches!(mode, FileMode::Export);
-        egui::Window::new(title).collapsible(false).resizable(true).default_size(vec2(520.0, 420.0)).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+        egui::Window::new(title).collapsible(false).resizable(true).default_size(vec2(520.0, 420.0)).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).order(egui::Order::Foreground).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("⬆ Up").clicked() { if let Some(p) = dir.parent() { *dir = p.to_path_buf(); refresh = true; } }
                 if ui.button("Home").clicked() { if let Some(hm) = std::env::var_os("HOME") { *dir = PathBuf::from(hm); refresh = true; } }

@@ -196,6 +196,69 @@ Rectangle, Rounded Rectangle, Ellipse.
   stores what it changed. Only if the steps' own data would pass 1.5 GB are the oldest dropped (that safety
   budget is **estimated**; the original uses disk instead).
 
+## Auto-Level: exact (version 0.1.1)
+`AutoLevelEffect.OnSetRenderInfo` (PaintDotNet.Effects.Legacy.dll 0x0600000c) builds an RGB histogram of
+the **selected** pixels, then `HistogramRgbLegacy.MakeLevelsAuto` (0x060000f9) calls
+`LevelOpLegacy.AutoFromLoMidHi(lo, mid, hi)` (0x0600012d) with:
+- lo = `GetPercentileColor(0.005)`, hi = `GetPercentileColor(0.995)`: per channel the first bin where the
+  running count exceeds total × fraction (`HistogramLegacy.GetPercentile` 0x060000ec);
+- mid = `GetMeanColor()`: the channel mean + 0.5, truncated (0x060000f5).
+- Per channel: gamma = clamp(Math.Log(0.5, (mid − lo)/(hi − lo)), 0.1, 10) when lo < mid < hi, else 1;
+  the channel then maps lo → black, hi → white with that gamma (same Level op as Levels).
+- Our addition: fully transparent pixels are left out of the histogram (they have no visible colour).
+  The earlier rebuild stretched plain min/max, which on most photos changed nothing.
+
+## Drop Shadow (Effects > Object): defaults exact
+`DropShadowGpuEffect.OnCreatePropertyCollection` (PaintDotNet.Effects.Gpu.dll 0x060002b6), property order
+confirmed by `OnCreateConfigUI` (0x060002b7) display names: Blur radius 10 (0..100), Distance 10 (0..100),
+Angle −45° (−180..180), Opacity 0.75 (0..1), Colour black, Shadow only off. The original notes it needs a
+layer with transparency. Rebuild: the layer's alpha shifted by distance toward the angle (counter-clockwise
+from the right, so −45° is down-right), Gaussian-blurred, drawn in black at the opacity behind the layer.
+The colour is fixed to the default black (the colour choice is not offered yet).
+
+## Tester round 2 additions (version 0.1.1, the person's design)
+- Tools, Colors, History and Layers are floating, resizable windows with slim headers; close them and bring
+  them back from View (Tools F5, History F6, Layers F7, Colors F8 — the original's keys) or reset positions.
+- Layers can be dragged up and down the list to change their order.
+- Pasting our own copy puts it back where it was copied from (any layer or picture of the same size).
+- A dropped or imported picture bigger than the canvas asks Expand canvas / Keep canvas size, like pastes.
+- Move Selection has the same free transform handles as Move Selected Pixels (move, resize, rotate); hard
+  selections stay hard-edged.
+- Arrow keys: see "Move tool keys" below (decoded); other tools scroll the view.
+- Shift keeps proportions on the side handles too (the other side grows by the same factor).
+- Brush hardness is a toolbar setting (default 75 %, the original's BrushSection value).
+- Unsaved pictures are backed up every 60 s to `~/.cache/paint-rs/autosave` (**estimated** interval);
+  after a crash or power cut the next start offers to recover them.
+- Speed: moving a floating picture or a smart object redraws only the old and new boxes; finished strokes
+  and selections no longer force a full redraw of the picture.
+
+## Move tool keys: exact (Ghidra pass of paintdotnet.exe again: FUN_140001430 0x140001430 only starts paintdotnet.dll, so these come from its IL)
+- `TransformControl.ProcessArrowKey` (paintdotnet.dll 0x060020e6): Left/Up/Right/Down (WPF keys 23–26) move
+  by (−1,0)/(0,−1)/(1,0)/(0,1) pixels; with **Ctrl** (`ModifierKeys & 2`) the step is ×10. (The earlier
+  rebuild used Shift — wrong.)
+- `TransformControl.OnKeyDown` (0x060020e5): the first arrow press starts one edit; each press restarts a
+  timer of max(500 ms, KeyboardDelayMs × 3 / 2); when it runs out the edit is committed, so a run of presses
+  is one history step. Escape during a mouse drag cancels that drag. **Rebuild differs on purpose (the
+  person's rule, 2026-11-08): every action is final at once** — each arrow press, each finished drag of a
+  floating picture, the paste itself and every brush/Clone Stamp stroke is its own history step
+  immediately; nothing waits for a pause, Enter or deselecting. Putting floating pixels down adds a
+  "Finish Pixels" step (the original's name for it).
+- `MoveTool.OnUIPreviewKeyDown` (0x06001e9c): Enter (key 6) or Escape (key 13) with a selection ends any
+  drawing/editing, commits the moved pixels and deselects. Rebuild does the same for Move Selected Pixels;
+  Undo still takes it back.
+
+## Clone Stamp: exact (paintdotnet.exe pass: FUN_140001430 0x140001430 and FUN_140001190 0x140001190 only find and start paintdotnet.dll, so the rules come from its IL)
+- `CloneStampTool.OnUIDragBegin` (paintdotnet.dll 0x06002155): Ctrl (`Modifiers & 2`) + press sets the
+  source point and remembers the **active layer** as the source layer (anchor mode 1); Ctrl+drag keeps moving
+  it (`OnUIDragMove` 0x06002156, `OnUIDragEnd` 0x06002157). Without a source (mode 0) a stroke does nothing.
+- On the first stroke after choosing a source, the source becomes a fixed offset = source − brush point
+  (mode 2); **every later stroke keeps that offset** (aligned cloning), until Ctrl+click picks a new source.
+  The earlier rebuild re-measured from the source point at each stroke — wrong.
+- `GetAnchorLayerIndex` (0x0600215b): pixels are copied from the source layer, even when painting on another.
+- `UpdateAnchor` (0x0600214e): the source marker follows the pointer by the offset and has radius = brush
+  width / 2.
+- Placing the source changes no pixels and adds no history step; each stroke is one step.
+
 ## 12. Files
 Opens PNG, JPEG, BMP, GIF, TIFF, TGA, WebP, ICO, QOI and its own layered `.pxe`; saves the same except ICO.
 The original's `.pdn` format is not read or written.
